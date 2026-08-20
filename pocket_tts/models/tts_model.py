@@ -22,6 +22,7 @@ from pocket_tts.conditioners.base import TokenizedText
 from pocket_tts.data.audio import audio_read
 from pocket_tts.data.audio_utils import convert_audio
 from pocket_tts.default_parameters import (
+    DEFAULT_CROSSFADE_DURATION_S,
     DEFAULT_EOS_THRESHOLD,
     DEFAULT_LANGUAGE,
     DEFAULT_LSD_DECODE_STEPS,
@@ -547,6 +548,7 @@ class TTSModel(nn.Module):
         max_tokens: int = MAX_TOKEN_PER_CHUNK,
         frames_after_eos: int | None = None,
         copy_state: bool = True,
+        crossfade_duration: float = DEFAULT_CROSSFADE_DURATION_S,
     ):
         """Generate audio streaming chunks from text input.
 
@@ -569,6 +571,12 @@ class TTSModel(nn.Module):
             copy_state: Whether to create a deep copy of the model state before
                 generation. If True, preserves the original state for reuse.
                 If False, modifies the input state in-place. Defaults to True.
+            crossfade_duration: Duration, in seconds, linearly crossfaded across
+                the boundary between consecutive sentence chunks. Long text is
+                split into per-sentence chunks that are each generated with a
+                freshly reset decoder state, which otherwise produces an
+                audible discontinuity at every chunk boundary. Set to 0 to
+                disable.
 
         Yields:
             torch.Tensor: Audio chunks with shape [samples] at the model's
@@ -613,20 +621,30 @@ class TTSModel(nn.Module):
             remove_semicolons=self.remove_semicolons,
         )
 
-        for chunk in chunks:
-            text_to_generate, frames_after_eos_guess = prepare_text_prompt(
-                chunk, self.pad_with_spaces_for_short_inputs, self.remove_semicolons
-            )
-            frames_after_eos_guess += 2
-            effective_frames = (
-                frames_after_eos if frames_after_eos is not None else frames_after_eos_guess
-            )
-            yield from self._generate_audio_stream_short_text(
-                model_state=model_state,
-                text_to_generate=text_to_generate,
-                frames_after_eos=effective_frames,
-                copy_state=copy_state,
-            )
+        def short_text_streams():
+            for chunk in chunks:
+                prepared_text, frames_after_eos_guess = prepare_text_prompt(
+                    chunk, self.pad_with_spaces_for_short_inputs, self.remove_semicolons
+                )
+                frames_after_eos_guess += 2
+                effective_frames = (
+                    frames_after_eos if frames_after_eos is not None else frames_after_eos_guess
+                )
+                yield self._generate_audio_stream_short_text(
+                    model_state=model_state,
+                    text_to_generate=prepared_text,
+                    frames_after_eos=effective_frames,
+                    copy_state=copy_state,
+                )
+
+        if len(chunks) <= 1:
+            # A single chunk has no boundary to smooth over.
+            for stream in short_text_streams():
+                yield from stream
+            return
+
+        crossfade_samples = int(crossfade_duration * self.sample_rate)
+        yield from _crossfade_concatenated_streams(short_text_streams(), crossfade_samples)
 
     @torch.no_grad
     def _generate_audio_stream_short_text(
@@ -1041,6 +1059,65 @@ def split_into_best_sentences(
             )
 
     return chunks
+
+
+def _crossfade_concatenated_streams(streams, crossfade_samples: int):
+    """Concatenate a sequence of audio-chunk generators into a single stream.
+
+    Chunks within a sub-stream are passed through unchanged. Only the boundary
+    between one sub-stream and the next is treated specially: the trailing
+    `crossfade_samples` samples produced so far are linearly crossfaded into
+    the leading samples of the next sub-stream, instead of being hard-spliced.
+    This masks the discontinuity that appears at those boundaries because each
+    sub-stream is decoded with a freshly reset decoder state.
+    """
+    tail = None  # trailing samples produced so far, held back for a possible crossfade
+
+    for stream in streams:
+        needed = crossfade_samples if tail is not None else 0
+        boundary_chunks = []
+        boundary_len = 0
+
+        for piece in stream:
+            if piece.shape[0] == 0:
+                continue
+
+            if needed > 0:
+                boundary_chunks.append(piece)
+                boundary_len += piece.shape[0]
+                if boundary_len < needed:
+                    continue
+                head = torch.cat(boundary_chunks)
+                n = min(needed, tail.shape[0])
+                fade_in = torch.linspace(0, 1, n, device=head.device, dtype=head.dtype)
+                blended = tail[-n:] * (1 - fade_in) + head[:n] * fade_in
+                if tail.shape[0] > n:
+                    yield tail[:-n]
+                yield blended
+                tail = head[n:] if head.shape[0] > n else None
+                needed = 0
+                continue
+
+            tail = piece if tail is None else torch.cat([tail, piece])
+            if tail.shape[0] > crossfade_samples:
+                cut = tail.shape[0] - crossfade_samples
+                yield tail[:cut]
+                tail = tail[cut:]
+
+        if needed > 0 and boundary_chunks:
+            # The sub-stream ended before enough samples arrived to fill a full
+            # crossfade window; blend with however much we got.
+            head = torch.cat(boundary_chunks)
+            n = min(needed, tail.shape[0], head.shape[0])
+            fade_in = torch.linspace(0, 1, n, device=head.device, dtype=head.dtype)
+            blended = tail[-n:] * (1 - fade_in) + head[:n] * fade_in
+            if tail.shape[0] > n:
+                yield tail[:-n]
+            yield blended
+            tail = head[n:] if head.shape[0] > n else None
+
+    if tail is not None and tail.shape[0] > 0:
+        yield tail
 
 
 def export_model_state(model_state: dict[str, dict[str, torch.Tensor]], dest: str | Path):

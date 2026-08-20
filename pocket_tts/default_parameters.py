@@ -4,6 +4,10 @@ DEFAULT_LSD_DECODE_STEPS = 1
 DEFAULT_NOISE_CLAMP = None
 DEFAULT_EOS_THRESHOLD = -4.0
 DEFAULT_FRAMES_AFTER_EOS = None
+# Duration, in seconds, crossfaded across the boundary between consecutive
+# sentence chunks in generate_audio_stream() to mask the decoder-state reset
+# that happens at each chunk boundary.
+DEFAULT_CROSSFADE_DURATION_S = 0.1
 # TODO: make this dynamic since english_2026-04 supports bigger chunks
 MAX_TOKEN_PER_CHUNK = 50
 
