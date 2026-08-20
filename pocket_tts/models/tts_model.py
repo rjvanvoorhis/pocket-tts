@@ -993,6 +993,33 @@ def _segments_from_boundaries(
     return segments
 
 
+def _hard_split_on_words(tokenizer, text: str, max_tokens: int) -> list[tuple[int, str]]:
+    """Last-resort split for a chunk with no comma/semicolon/colon to break on.
+
+    Packs whole words greedily, cutting to a new segment whenever the next
+    word would push the current one over max_tokens. If a single word alone
+    exceeds max_tokens (pathological), it's kept as its own oversized
+    segment rather than split mid-word.
+    """
+    words = text.split()
+    segments = []
+    current_words: list[str] = []
+    current_nb_tokens = 0
+    for word in words:
+        candidate_text = " ".join(current_words + [word])
+        nb_tokens = len(tokenizer(candidate_text).tokens[0])
+        if current_words and nb_tokens > max_tokens:
+            segments.append((current_nb_tokens, " ".join(current_words)))
+            current_words = [word]
+            current_nb_tokens = len(tokenizer(word).tokens[0])
+        else:
+            current_words.append(word)
+            current_nb_tokens = nb_tokens
+    if current_words:
+        segments.append((current_nb_tokens, " ".join(current_words)))
+    return segments
+
+
 def split_into_best_sentences(
     tokenizer,
     text_to_generate: str,
@@ -1027,6 +1054,19 @@ def split_into_best_sentences(
                 refined_segments.extend(sub_segments)
             else:
                 refined_segments.append((nb_tokens, text))
+
+    # A sentence with no comma/semicolon/colon (e.g. a long run-on clause)
+    # comes out of the pass above still oversized. Rather than generate it
+    # as a single out-of-distribution chunk, fall back to packing whole
+    # words up to max_tokens - a mid-sentence break is less bad than the
+    # word-skipping an oversized chunk risks.
+    final_segments = []
+    for nb_tokens, text in refined_segments:
+        if nb_tokens <= max_tokens:
+            final_segments.append((nb_tokens, text))
+        else:
+            final_segments.extend(_hard_split_on_words(tokenizer, text.strip(), max_tokens))
+    refined_segments = final_segments
 
     max_nb_tokens_in_a_chunk = max_tokens
     chunks = []

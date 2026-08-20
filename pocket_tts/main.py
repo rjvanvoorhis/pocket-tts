@@ -55,6 +55,11 @@ tts_model: TTSModel | None = None
 # the lifespan startup hook below.
 VOICES_DIR: Path = Path(DEFAULT_VOICES_DIR)
 
+# Server-wide default for max_tokens (tokens per generated chunk before a
+# sentence gets split further), overridable per-request on /tts. Set by the
+# lifespan startup hook below.
+DEFAULT_MAX_TOKENS_PER_CHUNK: int = MAX_TOKEN_PER_CHUNK
+
 _VOICE_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 
 # serve() can't load the model directly and hand it to worker processes: with
@@ -66,12 +71,13 @@ _ENV_LANGUAGE = "POCKET_TTS_LANGUAGE"
 _ENV_CONFIG = "POCKET_TTS_CONFIG"
 _ENV_QUANTIZE = "POCKET_TTS_QUANTIZE"
 _ENV_VOICES_DIR = "POCKET_TTS_VOICES_DIR"
+_ENV_MAX_TOKENS = "POCKET_TTS_MAX_TOKENS"
 _ENV_QUIET = "POCKET_TTS_QUIET"
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global tts_model, VOICES_DIR
+    global tts_model, VOICES_DIR, DEFAULT_MAX_TOKENS_PER_CHUNK
 
     quiet = os.environ.get(_ENV_QUIET) == "1"
     with enable_logging("pocket_tts", logging.ERROR if quiet else logging.INFO):
@@ -79,6 +85,9 @@ async def lifespan(app: FastAPI):
         config = os.environ.get(_ENV_CONFIG) or None
         quantize = os.environ.get(_ENV_QUANTIZE) == "1"
         voices_dir = os.environ.get(_ENV_VOICES_DIR, DEFAULT_VOICES_DIR)
+        DEFAULT_MAX_TOKENS_PER_CHUNK = int(
+            os.environ.get(_ENV_MAX_TOKENS) or MAX_TOKEN_PER_CHUNK
+        )
 
         logger.info("Loading model instance (pid=%d)...", os.getpid())
         tts_model = TTSModel.load_model(
@@ -128,7 +137,7 @@ async def health():
     return {"status": "healthy"}
 
 
-def write_to_queue(queue, text_to_generate, model_state):
+def write_to_queue(queue, text_to_generate, model_state, max_tokens: int):
     """Allows writing to the StreamingResponse as if it were a file."""
 
     class FileLikeToQueue(io.IOBase):
@@ -145,19 +154,19 @@ def write_to_queue(queue, text_to_generate, model_state):
             self.queue.put(None)
 
     audio_chunks = tts_model.generate_audio_stream(
-        model_state=model_state, text_to_generate=text_to_generate
+        model_state=model_state, text_to_generate=text_to_generate, max_tokens=max_tokens
     )
     stream_audio_chunks(
         FileLikeToQueue(queue), audio_chunks, tts_model.config.mimi.sample_rate
     )
 
 
-def generate_data_with_state(text_to_generate: str, model_state: dict):
+def generate_data_with_state(text_to_generate: str, model_state: dict, max_tokens: int):
     queue = Queue()
 
     # Run your function in a thread
     thread = threading.Thread(
-        target=write_to_queue, args=(queue, text_to_generate, model_state)
+        target=write_to_queue, args=(queue, text_to_generate, model_state, max_tokens)
     )
     thread.start()
 
@@ -178,6 +187,12 @@ def text_to_speech(
     text: str = Form(...),
     voice_url: str | None = Form(None),
     voice_wav: UploadFile | None = File(None),
+    max_tokens: int | None = Form(
+        None,
+        description="Max tokens per generated chunk. Long sentences get split at "
+        "commas/semicolons/colons once they exceed this. Defaults to the "
+        "server's --max-tokens setting.",
+    ),
 ):
     """
     Generate speech from text using the pre-loaded voice prompt or a custom voice.
@@ -187,9 +202,15 @@ def text_to_speech(
         voice_url: Optional built-in voice name (e.g., "alba"), or voice URL (http://, https://, or hf://).
             Can point to a voice profile's .safetensors data, e.g. http://localhost:8000/voices/<id>/data
         voice_wav: Optional uploaded voice file (mutually exclusive with voice_url)
+        max_tokens: Optional override for the server's --max-tokens setting, for this request only.
     """
     if not text.strip():
         raise HTTPException(status_code=400, detail="Text cannot be empty")
+
+    if max_tokens is None:
+        max_tokens = DEFAULT_MAX_TOKENS_PER_CHUNK
+    elif max_tokens <= 0:
+        raise HTTPException(status_code=400, detail="max_tokens must be positive")
 
     if voice_url is None and voice_wav is None:
         voice_url = get_default_voice_for_language(str(tts_model.origin))
@@ -233,7 +254,7 @@ def text_to_speech(
         raise HTTPException(status_code=500, detail="This should never happen.")
 
     return StreamingResponse(
-        generate_data_with_state(text, model_state),
+        generate_data_with_state(text, model_state, max_tokens),
         media_type="audio/wav",
         headers={
             "Content-Disposition": "attachment; filename=generated_speech.wav",
@@ -381,6 +402,17 @@ def serve(
         str,
         typer.Option(help="Directory to store voice profiles created via POST /voices"),
     ] = DEFAULT_VOICES_DIR,
+    max_tokens: Annotated[
+        int,
+        typer.Option(
+            help="Default max tokens per generated chunk. Text is split into "
+            "sentences and packed into chunks up to this size before generation; "
+            "a single sentence longer than this still gets generated as one "
+            "oversized chunk (after trying to sub-split it on commas/semicolons), "
+            "which can skip words. Overridable per-request via the /tts "
+            "'max_tokens' form field."
+        ),
+    ] = MAX_TOKEN_PER_CHUNK,
     batch_size: Annotated[
         int,
         typer.Option(
@@ -411,6 +443,7 @@ def serve(
     os.environ[_ENV_CONFIG] = config or ""
     os.environ[_ENV_QUANTIZE] = "1" if quantize else "0"
     os.environ[_ENV_VOICES_DIR] = voices_dir
+    os.environ[_ENV_MAX_TOKENS] = str(max_tokens)
     os.environ[_ENV_QUIET] = "1" if quiet else "0"
 
     uvicorn.run(

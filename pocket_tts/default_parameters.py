@@ -8,7 +8,12 @@ DEFAULT_FRAMES_AFTER_EOS = None
 # sentence chunks in generate_audio_stream() to mask the decoder-state reset
 # that happens at each chunk boundary.
 DEFAULT_CROSSFADE_DURATION_S = 0.1
-# TODO: make this dynamic since english_2026-04 supports bigger chunks
+# Overridable via `serve --max-tokens` / the /tts `max_tokens` form field, and
+# the `generate --max-tokens` CLI option. 50 is a conservative default; some
+# models (e.g. english_2026-04) reportedly tolerate bigger chunks, but the
+# practical per-model ceiling (where generation quality degrades) hasn't been
+# measured yet - it requires listening to samples, not just checking for
+# crashes/warnings.
 MAX_TOKEN_PER_CHUNK = 50
 # Where the server persists voice profiles created via POST /voices
 DEFAULT_VOICES_DIR = "./data/voices"

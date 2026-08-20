@@ -87,14 +87,21 @@ def test_mixed_sentences_and_commas(tokenizer):
     assert len(chunks) >= 3
 
 
-def test_no_commas_no_periods_stays_single_chunk(tokenizer):
-    """Text with no splitting characters stays as a single chunk."""
+def test_no_commas_no_periods_hard_splits_on_words(tokenizer):
+    """Text with no punctuation to split on falls back to word-boundary splitting."""
     text = "one two three four five six seven eight nine ten eleven twelve"
     chunks = split_into_best_sentences(
         tokenizer, text, 5, pad_with_spaces_for_short_inputs=False, remove_semicolons=False
     )
-    # Should be 1 chunk since there are no split points
-    assert len(chunks) == 1
+    # No comma/semicolon/colon to split on, so it falls back to packing whole
+    # words up to max_tokens rather than generating one oversized chunk.
+    assert len(chunks) > 1
+    for chunk in chunks:
+        token_count = len(tokenizer(chunk.strip()).tokens[0].tolist())
+        assert token_count <= 5
+    rejoined = " ".join(chunks).lower()
+    for word in text.split():
+        assert word in rejoined
 
 
 def test_semicolons_and_colons_also_split(tokenizer):
@@ -128,14 +135,18 @@ def test_empty_string_raises(tokenizer):
         )
 
 
-def test_oversized_clause_without_commas_still_returns(tokenizer):
-    """A long clause with no split points should still be returned (not dropped)."""
-    # 20 words with no punctuation at all - no way to split
+def test_oversized_clause_without_commas_hard_splits_but_preserves_words(tokenizer):
+    """A long clause with no split points is hard-split on words, not dropped."""
+    # 20 words with no punctuation at all - no comma/semicolon/colon to split on
     text = " ".join(f"word{i}" for i in range(20))
     chunks = split_into_best_sentences(
         tokenizer, text, 5, pad_with_spaces_for_short_inputs=False, remove_semicolons=False
     )
-    assert len(chunks) == 1
+    assert len(chunks) > 1
+    for chunk in chunks:
+        token_count = len(tokenizer(chunk.strip()).tokens[0].tolist())
+        assert token_count <= 5
     # prepare_text_prompt capitalizes the first char and adds a trailing period,
-    # so compare case-insensitively and strip punctuation
-    assert chunks[0].lower().rstrip(".") == text.lower()
+    # so compare case-insensitively and strip punctuation; all words preserved.
+    rejoined = " ".join(chunks).lower().rstrip(".")
+    assert rejoined == text.lower()
