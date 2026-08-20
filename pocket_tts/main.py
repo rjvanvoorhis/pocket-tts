@@ -6,6 +6,7 @@ import sys
 import tempfile
 import threading
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from queue import Queue
 
@@ -45,18 +46,56 @@ cli_app = typer.Typer(
 # The pocket-tts server implementation
 # ------------------------------------------------------
 
-# Global model instance
+# Global model instance, one per worker process. With `batch_size > 1`,
+# uvicorn spawns multiple worker processes (each a full copy of this module),
+# so each worker ends up with its own independent `tts_model` here.
 tts_model: TTSModel | None = None
 
-# Directory where cloned voice profiles (.safetensors) are persisted, set by serve()
+# Directory where cloned voice profiles (.safetensors) are persisted, set by
+# the lifespan startup hook below.
 VOICES_DIR: Path = Path(DEFAULT_VOICES_DIR)
 
 _VOICE_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
+
+# serve() can't load the model directly and hand it to worker processes: with
+# `batch_size > 1`, uvicorn spawns separate worker processes that each import
+# this module fresh, so model loading has to happen per-worker in the
+# lifespan hook below. serve() passes its CLI options through via env vars,
+# which subprocesses inherit automatically.
+_ENV_LANGUAGE = "POCKET_TTS_LANGUAGE"
+_ENV_CONFIG = "POCKET_TTS_CONFIG"
+_ENV_QUANTIZE = "POCKET_TTS_QUANTIZE"
+_ENV_VOICES_DIR = "POCKET_TTS_VOICES_DIR"
+_ENV_QUIET = "POCKET_TTS_QUIET"
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global tts_model, VOICES_DIR
+
+    quiet = os.environ.get(_ENV_QUIET) == "1"
+    with enable_logging("pocket_tts", logging.ERROR if quiet else logging.INFO):
+        language = os.environ.get(_ENV_LANGUAGE) or None
+        config = os.environ.get(_ENV_CONFIG) or None
+        quantize = os.environ.get(_ENV_QUANTIZE) == "1"
+        voices_dir = os.environ.get(_ENV_VOICES_DIR, DEFAULT_VOICES_DIR)
+
+        logger.info("Loading model instance (pid=%d)...", os.getpid())
+        tts_model = TTSModel.load_model(
+            language=language, config=config, quantize=quantize
+        )
+        VOICES_DIR = Path(voices_dir).expanduser()
+        VOICES_DIR.mkdir(parents=True, exist_ok=True)
+        logger.info("Model instance loaded (pid=%d).", os.getpid())
+
+        yield
+
 
 web_app = FastAPI(
     title="Kyutai Pocket TTS API",
     description="Text-to-Speech generation API",
     version="1.0.0",
+    lifespan=lifespan,
 )
 web_app.add_middleware(
     CORSMiddleware,
@@ -342,15 +381,45 @@ def serve(
         str,
         typer.Option(help="Directory to store voice profiles created via POST /voices"),
     ] = DEFAULT_VOICES_DIR,
+    batch_size: Annotated[
+        int,
+        typer.Option(
+            help="Number of independent model instances to run, each in its own "
+            "worker process (like running `serve` this many times). Each instance "
+            "uses ~450MB memory (~234MB with --quantize) and can handle one "
+            "request at a time, so this many requests can be processed "
+            "concurrently. Default is 1 (a single process, no concurrency)."
+        ),
+    ] = 1,
+    quiet: Annotated[
+        bool, typer.Option("-q", "--quiet", help="Disable logging output")
+    ] = False,
 ):
     """Start the FastAPI server."""
 
-    global tts_model, VOICES_DIR
-    tts_model = TTSModel.load_model(language=language, config=config, quantize=quantize)
-    VOICES_DIR = Path(voices_dir).expanduser()
-    VOICES_DIR.mkdir(parents=True, exist_ok=True)
+    if reload and batch_size > 1:
+        raise typer.BadParameter(
+            "--reload and --batch-size > 1 cannot be used together."
+        )
 
-    uvicorn.run("pocket_tts.main:web_app", host=host, port=port, reload=reload)
+    # The model itself can't be loaded here and shared with worker processes:
+    # each worker (when batch_size > 1) is a separate process that imports
+    # this module fresh, so loading happens per-worker in the `lifespan`
+    # startup hook instead. Pass the options through via env vars, which
+    # worker subprocesses inherit.
+    os.environ[_ENV_LANGUAGE] = language or ""
+    os.environ[_ENV_CONFIG] = config or ""
+    os.environ[_ENV_QUANTIZE] = "1" if quantize else "0"
+    os.environ[_ENV_VOICES_DIR] = voices_dir
+    os.environ[_ENV_QUIET] = "1" if quiet else "0"
+
+    uvicorn.run(
+        "pocket_tts.main:web_app",
+        host=host,
+        port=port,
+        reload=reload,
+        workers=batch_size if batch_size > 1 else None,
+    )
 
 
 # ------------------------------------------------------
