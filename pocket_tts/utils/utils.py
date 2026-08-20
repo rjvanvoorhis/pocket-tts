@@ -1,6 +1,7 @@
 import hashlib
 import logging
 import os
+import threading
 import time
 from email.message import Message
 from pathlib import Path
@@ -104,23 +105,40 @@ def download_if_necessary(file_path: str) -> Path:
     if file_path.startswith("http://") or file_path.startswith("https://"):
         cache_dir = make_cache_directory()
         cache_key = hashlib.sha256(file_path.encode()).hexdigest()
+
+        # A URL with no file extension in its path (e.g. a REST endpoint like
+        # /voices/<id>/data) won't match a `cache_key + suffix` path built
+        # before we know the real suffix, so look for any already-cached
+        # file under this key regardless of extension rather than guessing.
+        existing = next(cache_dir.glob(cache_key + ".*"), None)
+        if existing is not None:
+            return existing
+
+        response = requests.get(file_path)
+        response.raise_for_status()
         suffix = Path(urlparse(file_path).path).suffix
+        if not suffix:
+            # The URL itself carries no file extension (e.g. a REST endpoint like
+            # /voices/<id>/data) - fall back to the server-provided filename so
+            # downstream format detection (e.g. .safetensors vs. audio) still works.
+            suffix = Path(
+                _filename_from_content_disposition(
+                    response.headers.get("content-disposition", "")
+                )
+            ).suffix
         cached_file = cache_dir / (cache_key + suffix)
-        if not cached_file.exists():
-            response = requests.get(file_path)
-            response.raise_for_status()
-            if not suffix:
-                # The URL itself carries no file extension (e.g. a REST endpoint like
-                # /voices/<id>/data) - fall back to the server-provided filename so
-                # downstream format detection (e.g. .safetensors vs. audio) still works.
-                suffix = Path(
-                    _filename_from_content_disposition(
-                        response.headers.get("content-disposition", "")
-                    )
-                ).suffix
-                cached_file = cache_dir / (cache_key + suffix)
-            with open(cached_file, "wb") as f:
-                f.write(response.content)
+
+        # Write to a uniquely-named temp file and atomically rename it into
+        # place. Without this, concurrent requests for the same URL (e.g.
+        # multiple TTS requests using the same cloned voice) would all miss
+        # the (nonexistent) cache above and race to `open(cached_file, "wb")`
+        # at the same time - each open() truncates the file, so one writer
+        # can wipe out another's in-progress bytes and leave a corrupt,
+        # truncated file behind. The "-tmp" separator (no dot right after
+        # cache_key) keeps these from matching the glob above.
+        tmp_file = cache_dir / f"{cache_key}-tmp{os.getpid()}-{threading.get_ident()}{suffix}"
+        tmp_file.write_bytes(response.content)
+        os.replace(tmp_file, cached_file)
         return cached_file
     elif file_path.startswith("hf://"):
         file_path = file_path.removeprefix("hf://")
