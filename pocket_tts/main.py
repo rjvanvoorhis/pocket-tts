@@ -1,3 +1,4 @@
+import asyncio
 import io
 import logging
 import os
@@ -6,8 +7,10 @@ import sys
 import tempfile
 import threading
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from queue import Queue
+from typing import List
 
 import typer
 import uvicorn
@@ -45,8 +48,12 @@ cli_app = typer.Typer(
 # The pocket-tts server implementation
 # ------------------------------------------------------
 
-# Global model instance
+# Global model instance (kept for backward compatibility with CLI commands)
 tts_model: TTSModel | None = None
+
+# Model pool for concurrent request handling
+model_pool: List[TTSModel] = []
+model_semaphore: asyncio.Semaphore | None = None
 
 # Directory where cloned voice profiles (.safetensors) are persisted, set by serve()
 VOICES_DIR: Path = Path(DEFAULT_VOICES_DIR)
@@ -89,7 +96,7 @@ async def health():
     return {"status": "healthy"}
 
 
-def write_to_queue(queue, text_to_generate, model_state):
+def write_to_queue(queue, text_to_generate, model_state, model: TTSModel):
     """Allows writing to the StreamingResponse as if it were a file."""
 
     class FileLikeToQueue(io.IOBase):
@@ -105,20 +112,20 @@ def write_to_queue(queue, text_to_generate, model_state):
         def close(self):
             self.queue.put(None)
 
-    audio_chunks = tts_model.generate_audio_stream(
+    audio_chunks = model.generate_audio_stream(
         model_state=model_state, text_to_generate=text_to_generate
     )
     stream_audio_chunks(
-        FileLikeToQueue(queue), audio_chunks, tts_model.config.mimi.sample_rate
+        FileLikeToQueue(queue), audio_chunks, model.config.mimi.sample_rate
     )
 
 
-def generate_data_with_state(text_to_generate: str, model_state: dict):
+def generate_data_with_state(text_to_generate: str, model_state: dict, model: TTSModel):
     queue = Queue()
 
     # Run your function in a thread
     thread = threading.Thread(
-        target=write_to_queue, args=(queue, text_to_generate, model_state)
+        target=write_to_queue, args=(queue, text_to_generate, model_state, model)
     )
     thread.start()
 
@@ -134,8 +141,23 @@ def generate_data_with_state(text_to_generate: str, model_state: dict):
     thread.join()
 
 
+@asynccontextmanager
+async def acquire_model():
+    """Acquire an available model from the pool."""
+    if model_pool and model_semaphore:
+        await model_semaphore.acquire()
+        model = model_pool.pop(0)
+        try:
+            yield model
+        finally:
+            model_pool.append(model)
+    else:
+        # Fallback for single model or CLI usage
+        yield tts_model
+
+
 @web_app.post("/tts")
-def text_to_speech(
+async def text_to_speech(
     text: str = Form(...),
     voice_url: str | None = Form(None),
     voice_wav: UploadFile | None = File(None),
@@ -152,49 +174,50 @@ def text_to_speech(
     if not text.strip():
         raise HTTPException(status_code=400, detail="Text cannot be empty")
 
-    if voice_url is None and voice_wav is None:
-        voice_url = get_default_voice_for_language(str(tts_model.origin))
+    async with acquire_model() as model:
+        if voice_url is None and voice_wav is None:
+            voice_url = get_default_voice_for_language(str(model.origin))
 
-    if voice_url is not None and voice_wav is not None:
-        raise HTTPException(
-            status_code=400, detail="Cannot provide both voice_url and voice_wav"
-        )
-
-    # Use the appropriate model state
-    if voice_url is not None:
-        if not (
-            voice_url.startswith("http://")
-            or voice_url.startswith("https://")
-            or voice_url.startswith("hf://")
-            or voice_url in _ORIGINS_OF_PREDEFINED_VOICES
-        ):
+        if voice_url is not None and voice_wav is not None:
             raise HTTPException(
-                status_code=400,
-                detail="voice_url must start with http://, https://, or hf://",
+                status_code=400, detail="Cannot provide both voice_url and voice_wav"
             )
-        model_state = tts_model._cached_get_state_for_audio_prompt(voice_url)
-        logging.warning("Using voice from URL: %s", voice_url)
-    elif voice_wav is not None:
-        # Use uploaded voice file - preserve extension for format detection
-        suffix = Path(voice_wav.filename).suffix if voice_wav.filename else ".wav"
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
-            content = voice_wav.file.read()
-            temp_file.write(content)
-            temp_file.flush()
-            temp_file_path = temp_file.name
 
-        # Close the file before reading it back (required on Windows)
-        try:
-            model_state = tts_model.get_state_for_audio_prompt(
-                Path(temp_file_path), truncate=True
-            )
-        finally:
-            os.unlink(temp_file_path)
-    else:
-        raise HTTPException(status_code=500, detail="This should never happen.")
+        # Use the appropriate model state
+        if voice_url is not None:
+            if not (
+                voice_url.startswith("http://")
+                or voice_url.startswith("https://")
+                or voice_url.startswith("hf://")
+                or voice_url in _ORIGINS_OF_PREDEFINED_VOICES
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="voice_url must start with http://, https://, or hf://",
+                )
+            model_state = model._cached_get_state_for_audio_prompt(voice_url)
+            logging.warning("Using voice from URL: %s", voice_url)
+        elif voice_wav is not None:
+            # Use uploaded voice file - preserve extension for format detection
+            suffix = Path(voice_wav.filename).suffix if voice_wav.filename else ".wav"
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
+                content = voice_wav.file.read()
+                temp_file.write(content)
+                temp_file.flush()
+                temp_file_path = temp_file.name
+
+            # Close the file before reading it back (required on Windows)
+            try:
+                model_state = model.get_state_for_audio_prompt(
+                    Path(temp_file_path), truncate=True
+                )
+            finally:
+                os.unlink(temp_file_path)
+        else:
+            raise HTTPException(status_code=500, detail="This should never happen.")
 
     return StreamingResponse(
-        generate_data_with_state(text, model_state),
+        generate_data_with_state(text, model_state, model),
         media_type="audio/wav",
         headers={
             "Content-Disposition": "attachment; filename=generated_speech.wav",
@@ -227,7 +250,7 @@ def _read_voice_record(path: Path) -> VoiceRecord | None:
 
 
 @web_app.post("/voices", response_model=VoiceRecord, status_code=201)
-def create_voice(
+async def create_voice(
     name: str = Form(...),
     voice_wav: UploadFile = File(...),
 ):
@@ -244,9 +267,10 @@ def create_voice(
 
     # Close the file before reading it back (required on Windows)
     try:
-        model_state = tts_model.get_state_for_audio_prompt(
-            Path(temp_file_path), truncate=True
-        )
+        async with acquire_model() as model:
+            model_state = model.get_state_for_audio_prompt(
+                Path(temp_file_path), truncate=True
+            )
     finally:
         os.unlink(temp_file_path)
 
@@ -342,13 +366,33 @@ def serve(
         str,
         typer.Option(help="Directory to store voice profiles created via POST /voices"),
     ] = DEFAULT_VOICES_DIR,
+    max_concurrent_requests: Annotated[
+        int,
+        typer.Option(
+            help="Number of concurrent TTS model instances to load. "
+            "Each instance uses ~450MB memory. Default is 1 (sequential processing)."
+        ),
+    ] = 1,
 ):
     """Start the FastAPI server."""
 
-    global tts_model, VOICES_DIR
-    tts_model = TTSModel.load_model(language=language, config=config, quantize=quantize)
+    global tts_model, VOICES_DIR, model_pool, model_semaphore
+
+    logger.info(f"Loading {max_concurrent_requests} model instance(s)...")
+    model_pool = [
+        TTSModel.load_model(language=language, config=config, quantize=quantize)
+        for _ in range(max_concurrent_requests)
+    ]
+    tts_model = model_pool[0]  # Keep first one for reference/backward compatibility
+    model_semaphore = asyncio.Semaphore(max_concurrent_requests)
     VOICES_DIR = Path(voices_dir).expanduser()
     VOICES_DIR.mkdir(parents=True, exist_ok=True)
+
+    estimated_memory_mb = 450 * max_concurrent_requests if not quantize else 234 * max_concurrent_requests
+    logger.info(
+        f"Loaded {len(model_pool)} model instance(s). "
+        f"Estimated memory usage: ~{estimated_memory_mb}MB"
+    )
 
     uvicorn.run("pocket_tts.main:web_app", host=host, port=port, reload=reload)
 
