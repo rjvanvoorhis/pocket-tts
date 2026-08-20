@@ -2,6 +2,7 @@ import hashlib
 import logging
 import os
 import time
+from email.message import Message
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -93,14 +94,31 @@ class display_execution_time:
         return False  # Don't suppress exceptions
 
 
+def _filename_from_content_disposition(content_disposition: str) -> str:
+    message = Message()
+    message["content-disposition"] = content_disposition
+    return message.get_filename(failobj="")
+
+
 def download_if_necessary(file_path: str) -> Path:
     if file_path.startswith("http://") or file_path.startswith("https://"):
         cache_dir = make_cache_directory()
+        cache_key = hashlib.sha256(file_path.encode()).hexdigest()
         suffix = Path(urlparse(file_path).path).suffix
-        cached_file = cache_dir / (hashlib.sha256(file_path.encode()).hexdigest() + suffix)
+        cached_file = cache_dir / (cache_key + suffix)
         if not cached_file.exists():
             response = requests.get(file_path)
             response.raise_for_status()
+            if not suffix:
+                # The URL itself carries no file extension (e.g. a REST endpoint like
+                # /voices/<id>/data) - fall back to the server-provided filename so
+                # downstream format detection (e.g. .safetensors vs. audio) still works.
+                suffix = Path(
+                    _filename_from_content_disposition(
+                        response.headers.get("content-disposition", "")
+                    )
+                ).suffix
+                cached_file = cache_dir / (cache_key + suffix)
             with open(cached_file, "wb") as f:
                 f.write(response.content)
         return cached_file

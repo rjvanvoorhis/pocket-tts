@@ -859,15 +859,7 @@ class TTSModel(nn.Module):
             - Processing time is logged for performance monitoring
             - The state preserves speaker characteristics for voice cloning
         """
-        if isinstance(audio_conditioning, (str, Path)) and _is_safetensors_source(
-            audio_conditioning
-        ):
-            if isinstance(audio_conditioning, str):
-                audio_conditioning = download_if_necessary(audio_conditioning)
-
-            return _import_model_state(audio_conditioning, self.device)
-
-        elif (
+        if (
             isinstance(audio_conditioning, str)
             and audio_conditioning in _ORIGINS_OF_PREDEFINED_VOICES
         ):
@@ -885,11 +877,20 @@ class TTSModel(nn.Module):
                 self.device,
             )
 
+        if isinstance(audio_conditioning, str):
+            # Download eagerly (rather than only once we know it's a safetensors source)
+            # so URLs without a .safetensors suffix in their path (e.g. a REST endpoint
+            # like /voices/<id>/data) can still be recognized via the downloaded file's
+            # server-provided filename.
+            audio_conditioning = download_if_necessary(audio_conditioning)
+
+        if isinstance(audio_conditioning, (str, Path)) and _is_safetensors_source(
+            audio_conditioning
+        ):
+            return _import_model_state(audio_conditioning, self.device)
+
         if not self.has_voice_cloning and isinstance(audio_conditioning, (str, Path)):
             raise ValueError(VOICE_CLONING_UNSUPPORTED)
-
-        if isinstance(audio_conditioning, str):
-            audio_conditioning = download_if_necessary(audio_conditioning)
 
         if isinstance(audio_conditioning, Path):
             audio, conditioning_sample_rate = audio_read(audio_conditioning)
@@ -1120,12 +1121,16 @@ def _crossfade_concatenated_streams(streams, crossfade_samples: int):
         yield tail
 
 
-def export_model_state(model_state: dict[str, dict[str, torch.Tensor]], dest: str | Path):
+def export_model_state(
+    model_state: dict[str, dict[str, torch.Tensor]],
+    dest: str | Path,
+    metadata: dict[str, str] | None = None,
+):
     dict_to_store = {}
     for module_name, module_state in model_state.items():
         for key, tensor_value in module_state.items():
             dict_to_store[f"{module_name}/{key}"] = tensor_value
-    safetensors.torch.save_file(dict_to_store, dest)
+    safetensors.torch.save_file(dict_to_store, dest, metadata=metadata)
 
 
 def _is_safetensors_source(source: str | Path) -> bool:

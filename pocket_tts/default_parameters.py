@@ -10,6 +10,8 @@ DEFAULT_FRAMES_AFTER_EOS = None
 DEFAULT_CROSSFADE_DURATION_S = 0.1
 # TODO: make this dynamic since english_2026-04 supports bigger chunks
 MAX_TOKEN_PER_CHUNK = 50
+# Where the server persists voice profiles created via POST /voices
+DEFAULT_VOICES_DIR = "./data/voices"
 
 DEFAULT_TEXT_FOR_LANGUAGE = {
     "english": (

@@ -1,9 +1,11 @@
 import io
 import logging
 import os
+import re
 import sys
 import tempfile
 import threading
+import uuid
 from pathlib import Path
 from queue import Queue
 
@@ -11,7 +13,9 @@ import typer
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse
+from pydantic import BaseModel
+from safetensors import safe_open
 from typing_extensions import Annotated
 
 from pocket_tts.data.audio import stream_audio_chunks
@@ -20,6 +24,7 @@ from pocket_tts.default_parameters import (
     DEFAULT_FRAMES_AFTER_EOS,
     DEFAULT_LSD_DECODE_STEPS,
     DEFAULT_NOISE_CLAMP,
+    DEFAULT_VOICES_DIR,
     MAX_TOKEN_PER_CHUNK,
     get_default_text_for_language,
     get_default_voice_for_language,
@@ -31,7 +36,8 @@ from pocket_tts.utils.utils import _ORIGINS_OF_PREDEFINED_VOICES
 logger = logging.getLogger(__name__)
 
 cli_app = typer.Typer(
-    help="Kyutai Pocket TTS - Text-to-Speech generation tool", pretty_exceptions_show_locals=False
+    help="Kyutai Pocket TTS - Text-to-Speech generation tool",
+    pretty_exceptions_show_locals=False,
 )
 
 
@@ -42,8 +48,15 @@ cli_app = typer.Typer(
 # Global model instance
 tts_model: TTSModel | None = None
 
+# Directory where cloned voice profiles (.safetensors) are persisted, set by serve()
+VOICES_DIR: Path = Path(DEFAULT_VOICES_DIR)
+
+_VOICE_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
+
 web_app = FastAPI(
-    title="Kyutai Pocket TTS API", description="Text-to-Speech generation API", version="1.0.0"
+    title="Kyutai Pocket TTS API",
+    description="Text-to-Speech generation API",
+    version="1.0.0",
 )
 web_app.add_middleware(
     CORSMiddleware,
@@ -95,14 +108,18 @@ def write_to_queue(queue, text_to_generate, model_state):
     audio_chunks = tts_model.generate_audio_stream(
         model_state=model_state, text_to_generate=text_to_generate
     )
-    stream_audio_chunks(FileLikeToQueue(queue), audio_chunks, tts_model.config.mimi.sample_rate)
+    stream_audio_chunks(
+        FileLikeToQueue(queue), audio_chunks, tts_model.config.mimi.sample_rate
+    )
 
 
 def generate_data_with_state(text_to_generate: str, model_state: dict):
     queue = Queue()
 
     # Run your function in a thread
-    thread = threading.Thread(target=write_to_queue, args=(queue, text_to_generate, model_state))
+    thread = threading.Thread(
+        target=write_to_queue, args=(queue, text_to_generate, model_state)
+    )
     thread.start()
 
     # Yield data as it becomes available
@@ -128,7 +145,8 @@ def text_to_speech(
 
     Args:
         text: Text to convert to speech
-        voice_url: Optional built-in voice name (e.g., "alba"), or voice URL (http://, https://, or hf://)
+        voice_url: Optional built-in voice name (e.g., "alba"), or voice URL (http://, https://, or hf://).
+            Can point to a voice profile's .safetensors data, e.g. http://localhost:8000/voices/<id>/data
         voice_wav: Optional uploaded voice file (mutually exclusive with voice_url)
     """
     if not text.strip():
@@ -138,7 +156,9 @@ def text_to_speech(
         voice_url = get_default_voice_for_language(str(tts_model.origin))
 
     if voice_url is not None and voice_wav is not None:
-        raise HTTPException(status_code=400, detail="Cannot provide both voice_url and voice_wav")
+        raise HTTPException(
+            status_code=400, detail="Cannot provide both voice_url and voice_wav"
+        )
 
     # Use the appropriate model state
     if voice_url is not None:
@@ -149,7 +169,8 @@ def text_to_speech(
             or voice_url in _ORIGINS_OF_PREDEFINED_VOICES
         ):
             raise HTTPException(
-                status_code=400, detail="voice_url must start with http://, https://, or hf://"
+                status_code=400,
+                detail="voice_url must start with http://, https://, or hf://",
             )
         model_state = tts_model._cached_get_state_for_audio_prompt(voice_url)
         logging.warning("Using voice from URL: %s", voice_url)
@@ -164,7 +185,9 @@ def text_to_speech(
 
         # Close the file before reading it back (required on Windows)
         try:
-            model_state = tts_model.get_state_for_audio_prompt(Path(temp_file_path), truncate=True)
+            model_state = tts_model.get_state_for_audio_prompt(
+                Path(temp_file_path), truncate=True
+            )
         finally:
             os.unlink(temp_file_path)
     else:
@@ -177,6 +200,98 @@ def text_to_speech(
             "Content-Disposition": "attachment; filename=generated_speech.wav",
             "Transfer-Encoding": "chunked",
         },
+    )
+
+
+# ------------------------------------------------------
+# Voice profile endpoints
+# ------------------------------------------------------
+
+
+class VoiceRecord(BaseModel):
+    id: str
+    name: str
+
+
+def _read_voice_record(path: Path) -> VoiceRecord | None:
+    try:
+        with safe_open(path, framework="pt") as f:
+            metadata = f.metadata() or {}
+    except Exception:
+        logger.warning("Skipping unreadable voice profile: %s", path)
+        return None
+    return VoiceRecord(
+        id=metadata.get("id", path.stem),
+        name=metadata.get("name", path.stem),
+    )
+
+
+@web_app.post("/voices", response_model=VoiceRecord, status_code=201)
+def create_voice(
+    name: str = Form(...),
+    voice_wav: UploadFile = File(...),
+):
+    """Clone a voice from an audio sample and save it as a reusable profile."""
+    if not name.strip():
+        raise HTTPException(status_code=400, detail="Name cannot be empty")
+
+    suffix = Path(voice_wav.filename).suffix if voice_wav.filename else ".wav"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
+        content = voice_wav.file.read()
+        temp_file.write(content)
+        temp_file.flush()
+        temp_file_path = temp_file.name
+
+    # Close the file before reading it back (required on Windows)
+    try:
+        model_state = tts_model.get_state_for_audio_prompt(
+            Path(temp_file_path), truncate=True
+        )
+    finally:
+        os.unlink(temp_file_path)
+
+    voice_id = uuid.uuid4().hex
+    dest_path = VOICES_DIR / f"{voice_id}.safetensors"
+    export_model_state(model_state, dest_path, metadata={"id": voice_id, "name": name})
+
+    return VoiceRecord(id=voice_id, name=name)
+
+
+@web_app.get("/voices", response_model=list[VoiceRecord])
+def list_voices():
+    """List all voice profiles available on this server."""
+    records = (
+        _read_voice_record(path) for path in sorted(VOICES_DIR.glob("*.safetensors"))
+    )
+    return [record for record in records if record is not None]
+
+
+@web_app.get("/voices/{voice_id}", response_model=VoiceRecord)
+def get_voice(voice_id: str):
+    """Look up a single voice profile by id."""
+    if not _VOICE_ID_PATTERN.match(voice_id):
+        raise HTTPException(status_code=404, detail="Voice not found")
+
+    path = VOICES_DIR / f"{voice_id}.safetensors"
+    record = _read_voice_record(path) if path.exists() else None
+    if record is None:
+        raise HTTPException(status_code=404, detail="Voice not found")
+    return record
+
+
+@web_app.get("/voices/{voice_id}/data")
+def get_voice_data(voice_id: str):
+    """Download the raw .safetensors file for a voice profile."""
+    if not _VOICE_ID_PATTERN.match(voice_id):
+        raise HTTPException(status_code=404, detail="Voice not found")
+
+    path = VOICES_DIR / f"{voice_id}.safetensors"
+    record = _read_voice_record(path) if path.exists() else None
+    if record is None:
+        raise HTTPException(status_code=404, detail="Voice not found")
+
+    return FileResponse(
+        path=path, media_type="application/octet-stream", filename=path.name
     )
 
 
@@ -204,11 +319,17 @@ def serve(
     quantize: Annotated[
         bool, typer.Option(help="Apply int8 quantization to reduce memory usage")
     ] = False,
+    voices_dir: Annotated[
+        str,
+        typer.Option(help="Directory to store voice profiles created via POST /voices"),
+    ] = DEFAULT_VOICES_DIR,
 ):
     """Start the FastAPI server."""
 
-    global tts_model
+    global tts_model, VOICES_DIR
     tts_model = TTSModel.load_model(language=language, config=config, quantize=quantize)
+    VOICES_DIR = Path(voices_dir).expanduser()
+    VOICES_DIR.mkdir(parents=True, exist_ok=True)
 
     uvicorn.run("pocket_tts.main:web_app", host=host, port=port, reload=reload)
 
@@ -233,7 +354,9 @@ def generate(
             show_default=False,
         ),
     ] = None,
-    quiet: Annotated[bool, typer.Option("-q", "--quiet", help="Disable logging output")] = False,
+    quiet: Annotated[
+        bool, typer.Option("-q", "--quiet", help="Disable logging output")
+    ] = False,
     language: Annotated[
         str | None,
         typer.Option(
@@ -266,8 +389,12 @@ def generate(
             "value from its config (0.3 for the English model, 0.7 otherwise)."
         ),
     ] = None,
-    noise_clamp: Annotated[float, typer.Option(help="Noise clamp value")] = DEFAULT_NOISE_CLAMP,
-    eos_threshold: Annotated[float, typer.Option(help="EOS threshold")] = DEFAULT_EOS_THRESHOLD,
+    noise_clamp: Annotated[
+        float, typer.Option(help="Noise clamp value")
+    ] = DEFAULT_NOISE_CLAMP,
+    eos_threshold: Annotated[
+        float, typer.Option(help="EOS threshold")
+    ] = DEFAULT_EOS_THRESHOLD,
     frames_after_eos: Annotated[
         int, typer.Option(help="Number of frames to generate after EOS")
     ] = DEFAULT_FRAMES_AFTER_EOS,
@@ -316,7 +443,9 @@ def generate(
             max_tokens=max_tokens,
         )
 
-        stream_audio_chunks(output_path, audio_chunks, tts_model.config.mimi.sample_rate)
+        stream_audio_chunks(
+            output_path, audio_chunks, tts_model.config.mimi.sample_rate
+        )
 
         # Only print the result message if not writing to stdout
         if output_path != "-":
@@ -341,7 +470,9 @@ def export_voice(
         str, typer.Argument(help="Audio file or directory to convert and export")
     ],
     export_path: Annotated[str, typer.Argument(help="Output file or directory")],
-    quiet: Annotated[bool, typer.Option("-q", "--quiet", help="Disable logging output")] = False,
+    quiet: Annotated[
+        bool, typer.Option("-q", "--quiet", help="Disable logging output")
+    ] = False,
     language: Annotated[
         str | None,
         typer.Option(
