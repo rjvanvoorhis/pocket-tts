@@ -75,7 +75,7 @@ web_app.add_middleware(
 async def root():
     """Serve the frontend."""
     static_path = Path(__file__).parent / "static" / "index.html"
-    content = static_path.read_text()
+    content = static_path.read_text(encoding='utf-8')
     # Replace the placeholder with the actual default text prompt
     print(str(tts_model.origin))
     content = content.replace(
@@ -293,6 +293,25 @@ def get_voice_data(voice_id: str):
     return FileResponse(
         path=path, media_type="application/octet-stream", filename=path.name
     )
+
+
+@web_app.delete("/voices/{voice_id}")
+def delete_voice(voice_id: str):
+    """Delete a voice profile."""
+    if not _VOICE_ID_PATTERN.match(voice_id):
+        raise HTTPException(status_code=404, detail="Voice not found")
+
+    path = VOICES_DIR / f"{voice_id}.safetensors"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Voice not found")
+
+    try:
+        path.unlink()
+        logger.info("Deleted voice profile: %s", voice_id)
+        return {"status": "deleted", "id": voice_id}
+    except Exception as e:
+        logger.error("Error deleting voice profile: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to delete voice")
 
 
 @cli_app.command()
