@@ -1242,64 +1242,69 @@ def _smooth_spectral_envelope(tail: torch.Tensor, head: torch.Tensor, n: int) ->
         n: Number of samples to analyze/blend at boundary
 
     Returns:
-        (smoothed_tail, smoothed_head): Spectrally smoothed boundary segments
+        (smoothed_tail, smoothed_head): Spectrally smoothed boundary segments,
+        each guaranteed to have shape [n]
     """
     # Use a modest FFT size for boundary analysis
-    fft_size = 512
-    if n < fft_size // 2:
+    fft_size = 2048
+    if n < 256:
         # Not enough samples for meaningful STFT; return unchanged
         return tail[-n:], head[:n]
 
     try:
-        # Extract boundary regions
+        # Extract boundary regions - guaranteed to be size n
         tail_seg = tail[-n:]
         head_seg = head[:n]
 
-        # Compute magnitude spectra using STFT
-        win_size = min(fft_size // 2, n // 2)
-        window = torch.hann_window(win_size, periodic=False, device=tail.device, dtype=tail.dtype)
+        # Use FFT on the full segment (pad if smaller than fft_size, truncate if larger)
+        if n < fft_size:
+            tail_padded = F.pad(tail_seg, (0, fft_size - n))
+            head_padded = F.pad(head_seg, (0, fft_size - n))
+        else:
+            # Take center portion for larger segments
+            start = max(0, (n - fft_size) // 2)
+            tail_padded = tail_seg[start : start + fft_size]
+            head_padded = head_seg[start : start + fft_size]
 
-        # Get boundary segments
-        tail_end = tail_seg[-win_size:] if tail_seg.shape[0] >= win_size else tail_seg
-        head_start = head_seg[:win_size] if head_seg.shape[0] >= win_size else head_seg
+        # Compute FFT and get magnitude/phase
+        tail_fft = torch.fft.rfft(tail_padded, n=fft_size)
+        head_fft = torch.fft.rfft(head_padded, n=fft_size)
 
-        # Pad if needed
-        if tail_end.shape[0] < win_size:
-            tail_end = F.pad(tail_end, (0, win_size - tail_end.shape[0]))
-        if head_start.shape[0] < win_size:
-            head_start = F.pad(head_start, (0, win_size - head_start.shape[0]))
-
-        # Apply Hann window and compute FFT
-        tail_windowed = tail_end * window
-        head_windowed = head_start * window
-
-        tail_fft = torch.fft.rfft(tail_windowed, n=fft_size)
-        head_fft = torch.fft.rfft(head_windowed, n=fft_size)
-
-        # Get magnitude and phase
         tail_mag = torch.abs(tail_fft)
         head_mag = torch.abs(head_fft)
         head_phase = torch.angle(head_fft)
 
-        # Smooth magnitude transition: blend magnitude but keep head's phase
-        # This reduces spectral jump while preserving prosody
+        # Blend magnitudes smoothly: head's phase with blended magnitude
+        # This reduces spectral discontinuity while preserving prosody
         fade = torch.linspace(0, 1, tail_mag.shape[0], device=tail.device, dtype=tail.dtype)
         blended_mag = tail_mag * (1 - fade) + head_mag * fade
 
-        # Reconstruct with blended magnitude and head's phase
+        # Reconstruct: use blended magnitude + head's phase
         blended_fft = blended_mag * torch.exp(1j * head_phase)
-        blended_time = torch.fft.irfft(blended_fft, n=fft_size)[:win_size]
+        blended_time = torch.fft.irfft(blended_fft, n=fft_size)
 
-        # Overlap-add: blend head_start with smoothed version
-        smooth_fade = torch.linspace(0, 1, len(blended_time), device=head.device, dtype=head.dtype)
-        smoothed_head_start = head_start * smooth_fade + blended_time * (1 - smooth_fade)
+        # Create fade envelope and apply to head segment
+        # This smoothly transitions from tail to head using spectral blending
+        window = torch.hann_window(n, periodic=False, device=head.device, dtype=head.dtype)
+        spectral_fade = torch.linspace(0, 1, n, device=head.device, dtype=head.dtype)
 
-        # Patch back into full segments
-        if tail_seg.shape[0] > win_size:
-            smoothed_tail = torch.cat([tail_seg[:-win_size], smoothed_head_start[:win_size // 2]])
+        # Blend: weight the spectrally smoothed version into the original head
+        # The longer the crossfade, the more blending. Use head_seg as base and blend in
+        smoothed_head = head_seg.clone()
+        
+        # Apply spectral envelope from blended spectrum at the start of the segment
+        if blended_time.shape[0] >= n:
+            # Blend with the start of the reconstructed audio
+            spectral_component = blended_time[:n]
         else:
-            smoothed_tail = tail_seg
-        smoothed_head = torch.cat([smoothed_head_start[win_size // 2:], head_seg[win_size:]])
+            # If reconstruction is shorter, pad it
+            spectral_component = F.pad(blended_time, (0, n - blended_time.shape[0]))
+
+        # Weight the spectral component in, scaled by envelope
+        blend_weight = 0.3  # Balance between original and spectrally smoothed (30% smooth, 70% original)
+        smoothed_head = (1 - blend_weight) * head_seg + blend_weight * spectral_component
+
+        smoothed_tail = tail_seg  # Keep tail unchanged, only smooth the head
 
         return smoothed_tail, smoothed_head
     except Exception as e:
