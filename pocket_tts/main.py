@@ -60,6 +60,11 @@ VOICES_DIR: Path = Path(DEFAULT_VOICES_DIR)
 # lifespan startup hook below.
 DEFAULT_MAX_TOKENS_PER_CHUNK: int = MAX_TOKEN_PER_CHUNK
 
+# Server-wide default for chunk_conditioning ("independent" or
+# "teacher_forcing"), overridable per-request on /tts. Set by the lifespan
+# startup hook below.
+DEFAULT_CHUNK_CONDITIONING: str = "independent"
+
 _VOICE_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 
 # serve() can't load the model directly and hand it to worker processes: with
@@ -72,12 +77,13 @@ _ENV_CONFIG = "POCKET_TTS_CONFIG"
 _ENV_QUANTIZE = "POCKET_TTS_QUANTIZE"
 _ENV_VOICES_DIR = "POCKET_TTS_VOICES_DIR"
 _ENV_MAX_TOKENS = "POCKET_TTS_MAX_TOKENS"
+_ENV_CHUNK_CONDITIONING = "POCKET_TTS_CHUNK_CONDITIONING"
 _ENV_QUIET = "POCKET_TTS_QUIET"
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global tts_model, VOICES_DIR, DEFAULT_MAX_TOKENS_PER_CHUNK
+    global tts_model, VOICES_DIR, DEFAULT_MAX_TOKENS_PER_CHUNK, DEFAULT_CHUNK_CONDITIONING
 
     quiet = os.environ.get(_ENV_QUIET) == "1"
     with enable_logging("pocket_tts", logging.ERROR if quiet else logging.INFO):
@@ -88,6 +94,7 @@ async def lifespan(app: FastAPI):
         DEFAULT_MAX_TOKENS_PER_CHUNK = int(
             os.environ.get(_ENV_MAX_TOKENS) or MAX_TOKEN_PER_CHUNK
         )
+        DEFAULT_CHUNK_CONDITIONING = os.environ.get(_ENV_CHUNK_CONDITIONING) or "independent"
 
         logger.info("Loading model instance (pid=%d)...", os.getpid())
         tts_model = TTSModel.load_model(
@@ -137,7 +144,9 @@ async def health():
     return {"status": "healthy"}
 
 
-def write_to_queue(queue, text_to_generate, model_state, max_tokens: int):
+def write_to_queue(
+    queue, text_to_generate, model_state, max_tokens: int, chunk_conditioning: str
+):
     """Allows writing to the StreamingResponse as if it were a file."""
 
     class FileLikeToQueue(io.IOBase):
@@ -154,19 +163,28 @@ def write_to_queue(queue, text_to_generate, model_state, max_tokens: int):
             self.queue.put(None)
 
     audio_chunks = tts_model.generate_audio_stream(
-        model_state=model_state, text_to_generate=text_to_generate, max_tokens=max_tokens
+        model_state=model_state,
+        text_to_generate=text_to_generate,
+        max_tokens=max_tokens,
+        chunk_conditioning=chunk_conditioning,
     )
     stream_audio_chunks(
         FileLikeToQueue(queue), audio_chunks, tts_model.config.mimi.sample_rate
     )
 
 
-def generate_data_with_state(text_to_generate: str, model_state: dict, max_tokens: int):
+def generate_data_with_state(
+    text_to_generate: str,
+    model_state: dict,
+    max_tokens: int,
+    chunk_conditioning: str,
+):
     queue = Queue()
 
     # Run your function in a thread
     thread = threading.Thread(
-        target=write_to_queue, args=(queue, text_to_generate, model_state, max_tokens)
+        target=write_to_queue,
+        args=(queue, text_to_generate, model_state, max_tokens, chunk_conditioning),
     )
     thread.start()
 
@@ -193,6 +211,13 @@ def text_to_speech(
         "commas/semicolons/colons once they exceed this. Defaults to the "
         "server's --max-tokens setting.",
     ),
+    chunk_conditioning: str | None = Form(
+        None,
+        description="How chunks after the first are generated when text is "
+        "split into multiple chunks: 'independent' (cheaper, default) or "
+        "'teacher_forcing' (slower, carries prosody forward). Defaults to "
+        "the server's --chunk-conditioning setting.",
+    ),
 ):
     """
     Generate speech from text using the pre-loaded voice prompt or a custom voice.
@@ -203,6 +228,8 @@ def text_to_speech(
             Can point to a voice profile's .safetensors data, e.g. http://localhost:8000/voices/<id>/data
         voice_wav: Optional uploaded voice file (mutually exclusive with voice_url)
         max_tokens: Optional override for the server's --max-tokens setting, for this request only.
+        chunk_conditioning: Optional override for the server's --chunk-conditioning
+            setting, for this request only.
     """
     if not text.strip():
         raise HTTPException(status_code=400, detail="Text cannot be empty")
@@ -211,6 +238,14 @@ def text_to_speech(
         max_tokens = DEFAULT_MAX_TOKENS_PER_CHUNK
     elif max_tokens <= 0:
         raise HTTPException(status_code=400, detail="max_tokens must be positive")
+
+    if chunk_conditioning is None:
+        chunk_conditioning = DEFAULT_CHUNK_CONDITIONING
+    elif chunk_conditioning not in ("independent", "teacher_forcing"):
+        raise HTTPException(
+            status_code=400,
+            detail="chunk_conditioning must be 'independent' or 'teacher_forcing'",
+        )
 
     if voice_url is None and voice_wav is None:
         voice_url = get_default_voice_for_language(str(tts_model.origin))
@@ -254,7 +289,7 @@ def text_to_speech(
         raise HTTPException(status_code=500, detail="This should never happen.")
 
     return StreamingResponse(
-        generate_data_with_state(text, model_state, max_tokens),
+        generate_data_with_state(text, model_state, max_tokens, chunk_conditioning),
         media_type="audio/wav",
         headers={
             "Content-Disposition": "attachment; filename=generated_speech.wav",
@@ -413,6 +448,19 @@ def serve(
             "'max_tokens' form field."
         ),
     ] = MAX_TOKEN_PER_CHUNK,
+    chunk_conditioning: Annotated[
+        str,
+        typer.Option(
+            help="Default strategy for generating chunks after the first, when "
+            "text is split into multiple chunks: 'independent' generates each "
+            "chunk from scratch off the voice prompt (cheaper, default); "
+            "'teacher-forcing' re-processes each chunk alongside the previous "
+            "one, forcing the decoder to replay the previous chunk's own audio "
+            "as context instead of resetting, at roughly double the generation "
+            "work per chunk. Overridable per-request via the /tts "
+            "'chunk_conditioning' form field."
+        ),
+    ] = "independent",
     batch_size: Annotated[
         int,
         typer.Option(
@@ -434,6 +482,12 @@ def serve(
             "--reload and --batch-size > 1 cannot be used together."
         )
 
+    chunk_conditioning = chunk_conditioning.replace("-", "_")
+    if chunk_conditioning not in ("independent", "teacher_forcing"):
+        raise typer.BadParameter(
+            "--chunk-conditioning must be 'independent' or 'teacher-forcing'."
+        )
+
     # The model itself can't be loaded here and shared with worker processes:
     # each worker (when batch_size > 1) is a separate process that imports
     # this module fresh, so loading happens per-worker in the `lifespan`
@@ -444,6 +498,7 @@ def serve(
     os.environ[_ENV_QUANTIZE] = "1" if quantize else "0"
     os.environ[_ENV_VOICES_DIR] = voices_dir
     os.environ[_ENV_MAX_TOKENS] = str(max_tokens)
+    os.environ[_ENV_CHUNK_CONDITIONING] = chunk_conditioning
     os.environ[_ENV_QUIET] = "1" if quiet else "0"
 
     uvicorn.run(
@@ -526,11 +581,28 @@ def generate(
     max_tokens: Annotated[
         int, typer.Option(help="Maximum number of tokens per chunk.")
     ] = MAX_TOKEN_PER_CHUNK,
+    chunk_conditioning: Annotated[
+        str,
+        typer.Option(
+            help="Strategy for generating chunks after the first, when text is "
+            "split into multiple chunks: 'independent' generates each chunk "
+            "from scratch off the voice prompt (cheaper, default); "
+            "'teacher-forcing' re-processes each chunk alongside the previous "
+            "one, forcing the decoder to replay the previous chunk's own audio "
+            "as context instead of resetting, at roughly double the "
+            "generation work per chunk."
+        ),
+    ] = "independent",
     quantize: Annotated[
         bool, typer.Option(help="Apply int8 quantization to reduce memory usage")
     ] = False,
 ):
     """Generate speech using Kyutai Pocket TTS."""
+    chunk_conditioning = chunk_conditioning.replace("-", "_")
+    if chunk_conditioning not in ("independent", "teacher_forcing"):
+        raise typer.BadParameter(
+            "--chunk-conditioning must be 'independent' or 'teacher-forcing'."
+        )
     log_level = logging.ERROR if quiet else logging.INFO
     with enable_logging("pocket_tts", log_level):
         if text is None:
@@ -562,6 +634,7 @@ def generate(
             text_to_generate=text,
             frames_after_eos=frames_after_eos,
             max_tokens=max_tokens,
+            chunk_conditioning=chunk_conditioning,
         )
 
         stream_audio_chunks(

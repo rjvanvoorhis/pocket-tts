@@ -29,6 +29,8 @@ This will generate a WAV file `./tts_output.wav` with the default text and voice
 - `--noise-clamp NOISE_CLAMP`: Noise clamp value (default: None)
 - `--eos-threshold EOS_THRESHOLD`: EOS threshold (default: -4.0)
 - `--frames-after-eos FRAMES_AFTER_EOS`: Number of frames to generate after EOS (default: None, auto-calculated based on the text length). Each frame is 80ms.
+- `--max-tokens MAX_TOKENS`: Max tokens per generated chunk (default: 50). Long text is split into sentences and packed into chunks up to this size; a single sentence longer than this still generates as one oversized chunk (after trying to sub-split it on commas/semicolons/colons), which can skip words.
+- `--chunk-conditioning`: Strategy for generating chunks after the first, when text needs multiple chunks (default: `independent`). `independent` generates each chunk from scratch off the voice prompt (cheaper); `teacher-forcing` re-processes each chunk alongside the previous one to carry prosody forward, at roughly double the generation work per chunk - see the [serve command's "Chunk Stitching" section](serve.md#chunk-stitching) for details (the mechanism is the same for `generate`, just single-shot instead of over HTTP).
 
 ### Performance Options
 

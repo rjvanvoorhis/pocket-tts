@@ -388,6 +388,25 @@ class TTSModel(nn.Module):
         conditioning = F.linear(latents, self.flow_lm.speaker_proj_weight)
         return conditioning
 
+    def _latent_from_audio(self, audio_conditioning: torch.Tensor) -> torch.Tensor:
+        """Encode raw audio into the flow_lm's own latent space - the same
+        space `backbone_input_latents`/`next_latent` live in during
+        autoregressive generation (not the `_encode_audio` conditioning
+        space, which is a separate projection). This is the inverse of the
+        `latent * emb_std + emb_mean` step in `_decode_audio_worker`, and is
+        used to build teacher-forcing targets from a chunk's own generated
+        audio.
+
+        Args:
+            audio_conditioning: Audio already at the model's sample rate,
+                shape [channels, samples].
+
+        Returns:
+            torch.Tensor: Latents of shape [1, T, ldim].
+        """
+        mimi_latent = self.mimi.encode_to_latent(audio_conditioning.unsqueeze(0).to(self.device))
+        return (mimi_latent.to(self.flow_lm.dtype) - self.flow_lm.emb_mean) / self.flow_lm.emb_std
+
     def _expand_kv_cache(self, model_state: dict, sequence_length: int) -> None:
         """Expand KV cache back to full sequence_length for generation.
 
@@ -480,6 +499,7 @@ class TTSModel(nn.Module):
         max_tokens: int = MAX_TOKEN_PER_CHUNK,
         frames_after_eos: int | None = None,
         copy_state: bool = True,
+        chunk_conditioning: str = "independent",
     ) -> torch.Tensor:
         """Generate complete audio tensor from text input.
 
@@ -503,6 +523,8 @@ class TTSModel(nn.Module):
             copy_state: Whether to create a deep copy of the model state before
                 generation. If True, preserves the original state for reuse.
                 If False, modifies the input state in-place. Defaults to True.
+            chunk_conditioning: "independent" (default) or "teacher_forcing" -
+                see generate_audio_stream() for details.
 
         Returns:
             torch.Tensor: Generated audio tensor with shape [channels, samples]
@@ -536,6 +558,7 @@ class TTSModel(nn.Module):
             frames_after_eos=frames_after_eos,
             copy_state=copy_state,
             max_tokens=max_tokens,
+            chunk_conditioning=chunk_conditioning,
         ):
             audio_chunks.append(chunk)
         return torch.cat(audio_chunks, dim=0)
@@ -549,6 +572,7 @@ class TTSModel(nn.Module):
         frames_after_eos: int | None = None,
         copy_state: bool = True,
         crossfade_duration: float = DEFAULT_CROSSFADE_DURATION_S,
+        chunk_conditioning: str = "independent",
     ):
         """Generate audio streaming chunks from text input.
 
@@ -577,6 +601,23 @@ class TTSModel(nn.Module):
                 freshly reset decoder state, which otherwise produces an
                 audible discontinuity at every chunk boundary. Set to 0 to
                 disable.
+            chunk_conditioning: How chunks after the first are generated:
+                - "independent" (default): each chunk is generated from
+                  scratch off the original voice prompt in `model_state`,
+                  with no knowledge of neighboring chunks' text or audio.
+                  Cheaper, but intonation/prosody can vary chunk to chunk.
+                - "teacher_forcing": chunk i is generated from text
+                  `chunk[i-1] + chunk[i]`, always starting fresh from the
+                  original voice prompt (so voice identity never drifts),
+                  but with the model's autoregressive decoder forced to
+                  reproduce chunk[i-1]'s own already-generated audio for
+                  that span instead of sampling it - only the new tail
+                  (chunk[i]'s audio) is actually sampled and kept. This
+                  gives the model real prior context (text and audio) to
+                  continue from, at the cost of roughly double the
+                  generation work per chunk (each chunk's text is processed
+                  twice: once as the new tail, once as forced context for
+                  the next chunk).
 
         Yields:
             torch.Tensor: Audio chunks with shape [samples] at the model's
@@ -609,10 +650,12 @@ class TTSModel(nn.Module):
         if frames_after_eos is None:
             frames_after_eos = self.model_recommended_frames_after_eos
 
-        # This is a very simplistic way of handling long texts. We could do much better
-        # by using teacher forcing, but it would be a bit slower.
-        # TODO: add the teacher forcing method for long texts where we use the audio of one chunk
-        # as conditioning for the next chunk.
+        if chunk_conditioning not in ("independent", "teacher_forcing"):
+            raise ValueError(
+                "chunk_conditioning must be 'independent' or 'teacher_forcing', "
+                f"got {chunk_conditioning!r}"
+            )
+
         chunks = split_into_best_sentences(
             self.flow_lm.conditioner.tokenizer,
             text_to_generate,
@@ -622,20 +665,47 @@ class TTSModel(nn.Module):
         )
 
         def short_text_streams():
+            previous_chunk_text = None
+            previous_chunk_audio = None
             for chunk in chunks:
+                if chunk_conditioning == "teacher_forcing" and previous_chunk_audio is not None:
+                    # Re-process the immediately preceding chunk's text
+                    # alongside this one so the model has read-ahead context,
+                    # but always starting fresh from the original voice
+                    # prompt (never chained through generated audio) so
+                    # voice identity doesn't drift chunk to chunk.
+                    text_for_generation = f"{previous_chunk_text} {chunk}"
+                    teacher_force_audio = previous_chunk_audio
+                else:
+                    text_for_generation = chunk
+                    teacher_force_audio = None
+
                 prepared_text, frames_after_eos_guess = prepare_text_prompt(
-                    chunk, self.pad_with_spaces_for_short_inputs, self.remove_semicolons
+                    text_for_generation, self.pad_with_spaces_for_short_inputs, self.remove_semicolons
                 )
                 frames_after_eos_guess += 2
                 effective_frames = (
                     frames_after_eos if frames_after_eos is not None else frames_after_eos_guess
                 )
-                yield self._generate_audio_stream_short_text(
+                stream = self._generate_audio_stream_short_text(
                     model_state=model_state,
                     text_to_generate=prepared_text,
                     frames_after_eos=effective_frames,
                     copy_state=copy_state,
+                    teacher_force_audio=teacher_force_audio,
                 )
+
+                if chunk_conditioning != "teacher_forcing":
+                    yield stream
+                    continue
+
+                # Capture this chunk's newly generated audio (the forced
+                # replay of the previous chunk is never decoded, so this
+                # already excludes it) to use as next chunk's forced prefix.
+                captured: list[torch.Tensor] = []
+                yield _tap(stream, captured)
+                previous_chunk_text = chunk
+                previous_chunk_audio = torch.cat(captured) if captured else None
 
         if len(chunks) <= 1:
             # A single chunk has no boundary to smooth over.
@@ -648,10 +718,21 @@ class TTSModel(nn.Module):
 
     @torch.no_grad
     def _generate_audio_stream_short_text(
-        self, model_state: dict, text_to_generate: str, frames_after_eos: int, copy_state: bool
+        self,
+        model_state: dict,
+        text_to_generate: str,
+        frames_after_eos: int,
+        copy_state: bool,
+        teacher_force_audio: torch.Tensor | None = None,
     ):
         if copy_state:
             model_state = copy.deepcopy(model_state)
+
+        forced_latents = (
+            self._latent_from_audio(teacher_force_audio.unsqueeze(0))
+            if teacher_force_audio is not None
+            else None
+        )
 
         prepared = self.flow_lm.conditioner.prepare(text_to_generate)
         token_count = prepared.tokens.shape[1]
@@ -681,6 +762,7 @@ class TTSModel(nn.Module):
             frames_after_eos=frames_after_eos,
             latents_queue=latents_queue,
             result_queue=result_queue,
+            forced_latents=forced_latents,
         )
 
         # Stream audio chunks as they become available
@@ -729,10 +811,12 @@ class TTSModel(nn.Module):
         frames_after_eos: int,
         latents_queue: queue.Queue,
         result_queue: queue.Queue,
+        forced_latents: torch.Tensor | None = None,
     ):
         token_count = prepared.tokens.shape[1]
+        forced_len = forced_latents.shape[1] if forced_latents is not None else 0
         current_end = self._flow_lm_current_end(model_state)
-        required_len = current_end + token_count + max_gen_len
+        required_len = current_end + token_count + forced_len + max_gen_len
         self._expand_kv_cache(model_state, sequence_length=required_len)
 
         with display_execution_time("Prompting text"):
@@ -743,7 +827,7 @@ class TTSModel(nn.Module):
         def run_generation():
             try:
                 self._autoregressive_generation(
-                    model_state, max_gen_len, frames_after_eos, latents_queue
+                    model_state, max_gen_len, frames_after_eos, latents_queue, forced_latents
                 )
             except Exception as e:
                 logger.error(f"Error in autoregressive generation: {e}")
@@ -760,7 +844,12 @@ class TTSModel(nn.Module):
 
     @torch.no_grad
     def _autoregressive_generation(
-        self, model_state: dict, max_gen_len: int, frames_after_eos: int, latents_queue: queue.Queue
+        self,
+        model_state: dict,
+        max_gen_len: int,
+        frames_after_eos: int,
+        latents_queue: queue.Queue,
+        forced_latents: torch.Tensor | None = None,
     ):
         backbone_input = torch.full(
             (1, 1, self.flow_lm.ldim),
@@ -768,6 +857,21 @@ class TTSModel(nn.Module):
             device=next(iter(self.flow_lm.parameters())).device,
             dtype=self.flow_lm.dtype,
         )
+
+        if forced_latents is not None:
+            # Teacher-force the model through the previous chunk's own
+            # already-committed audio: advance the KV cache step by step as
+            # if the model had generated it (each step's *input* is the real
+            # latent, not what the model itself predicted), but discard its
+            # predictions for this span - that audio is already known and
+            # won't be re-decoded. This is what lets free generation below
+            # continue with the exact prior context instead of resetting.
+            for step in range(forced_latents.shape[1]):
+                self._run_flow_lm_and_increment_step(
+                    model_state=model_state, backbone_input_latents=backbone_input
+                )
+                backbone_input = forced_latents[:, step : step + 1, :]
+
         steps_times = []
         eos_step = None
         for generation_step in range(max_gen_len):
@@ -1100,6 +1204,16 @@ def split_into_best_sentences(
             )
 
     return chunks
+
+
+def _tap(stream, sink: list):
+    """Pass an audio-chunk stream through unchanged while collecting its
+    pieces into `sink`, so the caller has the full chunk audio available
+    once the stream is exhausted (used for "teacher_forcing" conditioning).
+    """
+    for piece in stream:
+        sink.append(piece)
+        yield piece
 
 
 def _crossfade_concatenated_streams(streams, crossfade_samples: int):

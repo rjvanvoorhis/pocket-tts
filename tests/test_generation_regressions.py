@@ -42,6 +42,66 @@ def test_generate_audio_stream_uses_prepared_chunk_text(monkeypatch):
     assert calls[0]["frames_after_eos"] == 5
 
 
+def test_generate_audio_stream_teacher_forcing_uses_previous_chunk_audio(monkeypatch):
+    calls = []
+
+    def fake_split_into_best_sentences(
+        tokenizer, text_to_generate, max_tokens, pad_with_spaces_for_short_inputs, remove_semicolons
+    ):
+        return ["chunk one", "chunk two"]
+
+    def fake_generate_audio_stream_short_text(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            yield torch.tensor([1.0, 2.0])
+        else:
+            yield torch.tensor([3.0])
+
+    monkeypatch.setattr(
+        tts_model_module, "split_into_best_sentences", fake_split_into_best_sentences
+    )
+    model = SimpleNamespace(
+        flow_lm=SimpleNamespace(conditioner=SimpleNamespace(tokenizer=object())),
+        model_recommended_frames_after_eos=None,
+        pad_with_spaces_for_short_inputs=False,
+        remove_semicolons=False,
+        sample_rate=24000,
+        _generate_audio_stream_short_text=fake_generate_audio_stream_short_text,
+    )
+
+    chunks = list(
+        TTSModel.generate_audio_stream(
+            model,
+            {},
+            "chunk one. chunk two.",
+            crossfade_duration=0.0,
+            chunk_conditioning="teacher_forcing",
+        )
+    )
+
+    assert len(calls) == 2
+    # First chunk has no predecessor to force against.
+    assert calls[0]["teacher_force_audio"] is None
+    assert calls[0]["text_to_generate"] == "Chunk one."
+    # Second chunk is conditioned on the first chunk's own generated audio,
+    # and its text includes the first chunk's text as read-ahead context.
+    assert calls[1]["teacher_force_audio"] is not None
+    assert torch.equal(calls[1]["teacher_force_audio"], torch.tensor([1.0, 2.0]))
+    assert calls[1]["text_to_generate"] == "Chunk one chunk two."
+    # Output excludes the replayed prefix - only each chunk's own new audio.
+    assert [c.tolist() for c in chunks] == [[1.0, 2.0], [3.0]]
+
+
+def test_generate_audio_stream_rejects_unknown_chunk_conditioning():
+    model = SimpleNamespace(model_recommended_frames_after_eos=None)
+    with pytest.raises(ValueError, match="chunk_conditioning"):
+        list(
+            TTSModel.generate_audio_stream(
+                model, {}, "hi", chunk_conditioning="not-a-real-mode"
+            )
+        )
+
+
 def test_generate_reports_autoregressive_errors_before_decoder_done():
     error = RuntimeError("generation failed")
 
