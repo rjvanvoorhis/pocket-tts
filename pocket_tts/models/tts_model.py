@@ -1216,15 +1216,111 @@ def _tap(stream, sink: list):
         yield piece
 
 
+def _make_hann_fade_window(n: int, device, dtype) -> torch.Tensor:
+    """Create a Hann-windowed fade curve from 0 to 1.
+
+    This gives a smooth, perceptually better fade than linear, with no
+    abrupt changes in curvature at the endpoints.
+    """
+    if n <= 1:
+        return torch.ones(n, device=device, dtype=dtype)
+    # Hann window shape: 0.5 * (1 - cos(pi * i / (n - 1))) for i in 0..n-1
+    # This naturally goes from 0 at i=0 to 1 at i=n-1
+    i = torch.arange(n, device=device, dtype=dtype)
+    return 0.5 * (1 - torch.cos(math.pi * i / (n - 1)))
+
+
+def _smooth_spectral_envelope(tail: torch.Tensor, head: torch.Tensor, n: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Smooth spectral envelope at chunk boundary using STFT analysis.
+
+    Analyzes the magnitude spectrum near the boundary and blends them to reduce
+    the "noise quality" jump that results from decoder state reset.
+
+    Args:
+        tail: Last chunk's audio (will use tail[-n:])
+        head: Next chunk's audio (will use head[:n])
+        n: Number of samples to analyze/blend at boundary
+
+    Returns:
+        (smoothed_tail, smoothed_head): Spectrally smoothed boundary segments
+    """
+    # Use a modest FFT size for boundary analysis
+    fft_size = 512
+    if n < fft_size // 2:
+        # Not enough samples for meaningful STFT; return unchanged
+        return tail[-n:], head[:n]
+
+    try:
+        # Extract boundary regions
+        tail_seg = tail[-n:]
+        head_seg = head[:n]
+
+        # Compute magnitude spectra using STFT
+        win_size = min(fft_size // 2, n // 2)
+        window = torch.hann_window(win_size, periodic=False, device=tail.device, dtype=tail.dtype)
+
+        # Get boundary segments
+        tail_end = tail_seg[-win_size:] if tail_seg.shape[0] >= win_size else tail_seg
+        head_start = head_seg[:win_size] if head_seg.shape[0] >= win_size else head_seg
+
+        # Pad if needed
+        if tail_end.shape[0] < win_size:
+            tail_end = F.pad(tail_end, (0, win_size - tail_end.shape[0]))
+        if head_start.shape[0] < win_size:
+            head_start = F.pad(head_start, (0, win_size - head_start.shape[0]))
+
+        # Apply Hann window and compute FFT
+        tail_windowed = tail_end * window
+        head_windowed = head_start * window
+
+        tail_fft = torch.fft.rfft(tail_windowed, n=fft_size)
+        head_fft = torch.fft.rfft(head_windowed, n=fft_size)
+
+        # Get magnitude and phase
+        tail_mag = torch.abs(tail_fft)
+        head_mag = torch.abs(head_fft)
+        head_phase = torch.angle(head_fft)
+
+        # Smooth magnitude transition: blend magnitude but keep head's phase
+        # This reduces spectral jump while preserving prosody
+        fade = torch.linspace(0, 1, tail_mag.shape[0], device=tail.device, dtype=tail.dtype)
+        blended_mag = tail_mag * (1 - fade) + head_mag * fade
+
+        # Reconstruct with blended magnitude and head's phase
+        blended_fft = blended_mag * torch.exp(1j * head_phase)
+        blended_time = torch.fft.irfft(blended_fft, n=fft_size)[:win_size]
+
+        # Overlap-add: blend head_start with smoothed version
+        smooth_fade = torch.linspace(0, 1, len(blended_time), device=head.device, dtype=head.dtype)
+        smoothed_head_start = head_start * smooth_fade + blended_time * (1 - smooth_fade)
+
+        # Patch back into full segments
+        if tail_seg.shape[0] > win_size:
+            smoothed_tail = torch.cat([tail_seg[:-win_size], smoothed_head_start[:win_size // 2]])
+        else:
+            smoothed_tail = tail_seg
+        smoothed_head = torch.cat([smoothed_head_start[win_size // 2:], head_seg[win_size:]])
+
+        return smoothed_tail, smoothed_head
+    except Exception as e:
+        # Spectral smoothing is a best-effort enhancement; fall back if it fails
+        logger.debug(f"Spectral envelope smoothing failed: {e}, using original audio")
+        return tail[-n:], head[:n]
+
+
 def _crossfade_concatenated_streams(streams, crossfade_samples: int):
     """Concatenate a sequence of audio-chunk generators into a single stream.
 
     Chunks within a sub-stream are passed through unchanged. Only the boundary
     between one sub-stream and the next is treated specially: the trailing
-    `crossfade_samples` samples produced so far are linearly crossfaded into
-    the leading samples of the next sub-stream, instead of being hard-spliced.
-    This masks the discontinuity that appears at those boundaries because each
-    sub-stream is decoded with a freshly reset decoder state.
+    `crossfade_samples` samples produced so far are crossfaded into the leading
+    samples of the next sub-stream using a smooth Hann window (not linear) and
+    spectral envelope smoothing to mask the discontinuity that appears at those
+    boundaries because each sub-stream is decoded with a freshly reset decoder state.
+    
+    Improvements over simple linear crossfade:
+    - Hann-windowed fade curves for smoother perceptual transitions
+    - STFT-based spectral envelope smoothing to reduce "noise quality" jumps
     """
     tail = None  # trailing samples produced so far, held back for a possible crossfade
 
@@ -1244,8 +1340,13 @@ def _crossfade_concatenated_streams(streams, crossfade_samples: int):
                     continue
                 head = torch.cat(boundary_chunks)
                 n = min(needed, tail.shape[0])
-                fade_in = torch.linspace(0, 1, n, device=head.device, dtype=head.dtype)
-                blended = tail[-n:] * (1 - fade_in) + head[:n] * fade_in
+                
+                # Apply spectral envelope smoothing before amplitude blending
+                tail_smooth, head_smooth = _smooth_spectral_envelope(tail, head, n)
+                
+                # Use Hann window fade instead of linear for smoother transition
+                fade_in = _make_hann_fade_window(n, device=head.device, dtype=head.dtype)
+                blended = tail_smooth[-n:] * (1 - fade_in) + head_smooth[:n] * fade_in
                 if tail.shape[0] > n:
                     yield tail[:-n]
                 yield blended
@@ -1264,8 +1365,13 @@ def _crossfade_concatenated_streams(streams, crossfade_samples: int):
             # crossfade window; blend with however much we got.
             head = torch.cat(boundary_chunks)
             n = min(needed, tail.shape[0], head.shape[0])
-            fade_in = torch.linspace(0, 1, n, device=head.device, dtype=head.dtype)
-            blended = tail[-n:] * (1 - fade_in) + head[:n] * fade_in
+            
+            # Apply spectral envelope smoothing before amplitude blending
+            tail_smooth, head_smooth = _smooth_spectral_envelope(tail, head, n)
+            
+            # Use Hann window fade instead of linear for smoother transition
+            fade_in = _make_hann_fade_window(n, device=head.device, dtype=head.dtype)
+            blended = tail_smooth[-n:] * (1 - fade_in) + head_smooth[:n] * fade_in
             if tail.shape[0] > n:
                 yield tail[:-n]
             yield blended
