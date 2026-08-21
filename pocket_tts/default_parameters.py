@@ -6,8 +6,15 @@ DEFAULT_EOS_THRESHOLD = -4.0
 DEFAULT_FRAMES_AFTER_EOS = None
 # Duration, in seconds, crossfaded across the boundary between consecutive
 # sentence chunks in generate_audio_stream() to mask the decoder-state reset
-# that happens at each chunk boundary.
+# that happens at each chunk boundary. Also used as the fade-to/from-silence
+# duration when DEFAULT_SILENCE_DURATION_S > 0.
 DEFAULT_CROSSFADE_DURATION_S = 0.1
+# Duration, in seconds, of true silence inserted between consecutive sentence
+# chunks in generate_audio_stream(), in place of directly crossfading one
+# chunk's audio into the next. Without a gap, chunk boundaries can sound like
+# the next sentence starts abruptly. Set to 0 to fall back to a gapless
+# crossfade (the old behavior).
+DEFAULT_SILENCE_DURATION_S = 0.15
 # Overridable via `serve --max-tokens` / the /tts `max_tokens` form field, and
 # the `generate --max-tokens` CLI option. 50 is a conservative default; some
 # models (e.g. english_2026-04) reportedly tolerate bigger chunks, but the

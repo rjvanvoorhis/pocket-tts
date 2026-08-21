@@ -21,10 +21,12 @@ from typing_extensions import Annotated
 
 from pocket_tts.data.audio import stream_audio_chunks
 from pocket_tts.default_parameters import (
+    DEFAULT_CROSSFADE_DURATION_S,
     DEFAULT_EOS_THRESHOLD,
     DEFAULT_FRAMES_AFTER_EOS,
     DEFAULT_LSD_DECODE_STEPS,
     DEFAULT_NOISE_CLAMP,
+    DEFAULT_SILENCE_DURATION_S,
     DEFAULT_VOICES_DIR,
     MAX_TOKEN_PER_CHUNK,
     get_default_text_for_language,
@@ -596,6 +598,24 @@ def generate(
     quantize: Annotated[
         bool, typer.Option(help="Apply int8 quantization to reduce memory usage")
     ] = False,
+    crossfade_duration: Annotated[
+        float,
+        typer.Option(
+            help="Duration, in seconds, of the fade applied at each chunk "
+            "boundary (see --silence-duration for what it fades to/from)."
+        ),
+    ] = DEFAULT_CROSSFADE_DURATION_S,
+    silence_duration: Annotated[
+        float,
+        typer.Option(
+            help="Duration, in seconds, of true silence inserted between "
+            "sentence chunks instead of crossfading them directly into each "
+            "other. Long text is split into independently-generated chunks, "
+            "which otherwise run into each other with no natural "
+            "inter-sentence pause. Set to 0 to fall back to a gapless "
+            "crossfade using --crossfade-duration alone."
+        ),
+    ] = DEFAULT_SILENCE_DURATION_S,
 ):
     """Generate speech using Kyutai Pocket TTS."""
     chunk_conditioning = chunk_conditioning.replace("-", "_")
@@ -635,6 +655,8 @@ def generate(
             frames_after_eos=frames_after_eos,
             max_tokens=max_tokens,
             chunk_conditioning=chunk_conditioning,
+            crossfade_duration=crossfade_duration,
+            silence_duration=silence_duration,
         )
 
         stream_audio_chunks(

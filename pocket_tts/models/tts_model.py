@@ -27,6 +27,7 @@ from pocket_tts.default_parameters import (
     DEFAULT_LANGUAGE,
     DEFAULT_LSD_DECODE_STEPS,
     DEFAULT_NOISE_CLAMP,
+    DEFAULT_SILENCE_DURATION_S,
     MAX_TOKEN_PER_CHUNK,
 )
 from pocket_tts.models.flow_lm import FlowLMModel
@@ -611,6 +612,7 @@ class TTSModel(nn.Module):
         frames_after_eos: int | None = None,
         copy_state: bool = True,
         crossfade_duration: float = DEFAULT_CROSSFADE_DURATION_S,
+        silence_duration: float = DEFAULT_SILENCE_DURATION_S,
         chunk_conditioning: str = "independent",
     ):
         """Generate audio streaming chunks from text input.
@@ -634,12 +636,23 @@ class TTSModel(nn.Module):
             copy_state: Whether to create a deep copy of the model state before
                 generation. If True, preserves the original state for reuse.
                 If False, modifies the input state in-place. Defaults to True.
-            crossfade_duration: Duration, in seconds, linearly crossfaded across
-                the boundary between consecutive sentence chunks. Long text is
+            crossfade_duration: Duration, in seconds, crossfaded across the
+                boundary between consecutive sentence chunks. Long text is
                 split into per-sentence chunks that are each generated with a
                 freshly reset decoder state, which otherwise produces an
                 audible discontinuity at every chunk boundary. Set to 0 to
-                disable.
+                disable. When `silence_duration` is 0, this is the length of
+                a gapless overlap-add crossfade blending one chunk's audio
+                into the next. When `silence_duration` is > 0, this instead
+                is the length of the fade down to (and back up from) silence
+                on either side of the inserted gap.
+            silence_duration: Duration, in seconds, of true silence inserted
+                between consecutive sentence chunks instead of crossfading
+                them directly into each other. Without a gap, chunk
+                boundaries tend to sound like the next sentence starts
+                abruptly, since each chunk is generated independently with no
+                natural inter-sentence pause. Set to 0 to fall back to a
+                gapless crossfade using `crossfade_duration` alone.
             chunk_conditioning: How chunks after the first are generated:
                 - "independent" (default): each chunk is generated from
                   scratch off the original voice prompt in `model_state`,
@@ -771,8 +784,33 @@ class TTSModel(nn.Module):
             return
 
         crossfade_samples = int(crossfade_duration * self.sample_rate)
+        # A chunk boundary that lands on a full stop reads naturally with the
+        # whole configured pause; one from a mid-sentence fallback split
+        # (comma/semicolon/colon) or a hard word-boundary split (no
+        # punctuation at all) is not a natural breath point, so it gets a
+        # shorter one instead.
+        boundary_silence_samples = [
+            int(
+                silence_duration
+                * self.sample_rate
+                * _SILENCE_MULTIPLIER_BY_BOUNDARY_KIND[
+                    _classify_chunk_boundary(chunks[i])
+                ]
+            )
+            for i in range(len(chunks) - 1)
+        ]
+        # Only bother buffering extra lookback for silence trimming if some
+        # boundary will actually get a silence gap.
+        trim_samples = (
+            int(_MAX_SILENCE_TRIM_S * self.sample_rate)
+            if any(s > 0 for s in boundary_silence_samples)
+            else 0
+        )
         yield from _crossfade_concatenated_streams(
-            short_text_streams(), crossfade_samples
+            short_text_streams(),
+            crossfade_samples,
+            boundary_silence_samples,
+            trim_samples,
         )
 
     @torch.no_grad
@@ -1300,6 +1338,36 @@ def split_into_best_sentences(
     return chunks
 
 
+# A chunk boundary from split_into_best_sentences() can land on different
+# kinds of punctuation depending on how the text had to be broken up: a full
+# stop most of the time, but a comma/semicolon/colon when an oversized
+# sentence was sub-split, or nothing at all when even that fallback failed
+# and a run-on clause was hard-split mid-word. Only the first is a natural
+# breath point, so it gets the whole configured pause; the others get a
+# fraction of it.
+_SILENCE_MULTIPLIER_BY_BOUNDARY_KIND = {
+    "sentence": 1.0,
+    "clause": 0.4,
+    "word": 0.15,
+}
+
+
+def _classify_chunk_boundary(chunk_text: str) -> str:
+    """Classify the punctuation `chunk_text` ends on: "sentence" (., !, ?,
+    possibly followed by closing quotes/brackets), "clause" (, ; :), or
+    "word" (no trailing punctuation at all).
+    """
+    stripped = chunk_text.rstrip().rstrip("\"'”’)]")
+    if not stripped:
+        return "word"
+    last = stripped[-1]
+    if last in ".!?":
+        return "sentence"
+    if last in ",;:":
+        return "clause"
+    return "word"
+
+
 def _tap(stream, sink: list):
     """Pass an audio-chunk stream through unchanged while collecting its
     pieces into `sink`, so the caller has the full chunk audio available
@@ -1408,24 +1476,140 @@ def _smooth_spectral_envelope(
         return tail[-n:], head[:n]
 
 
-def _crossfade_concatenated_streams(streams, crossfade_samples: int):
+# How much of a chunk's own natural trailing/leading near-silence (e.g. from
+# frames_after_eos padding) to strip before inserting the boundary's own
+# silence gap, so the gap between sentences has a consistent, configured
+# length rather than the model's trailing silence stacking on top of it.
+_MAX_SILENCE_TRIM_S = 0.3
+# Samples at or below this absolute amplitude (audio is float32 in [-1, 1])
+# count as "near silence" for trimming purposes.
+_SILENCE_TRIM_AMPLITUDE_THRESHOLD = 0.01
+
+
+def _trim_trailing_near_silence(audio: torch.Tensor, max_trim: int) -> torch.Tensor:
+    """Strip near-silent samples from the end of `audio`, looking back at
+    most `max_trim` samples. If the whole lookback window is near-silent, all
+    of it is trimmed.
+    """
+    if max_trim <= 0 or audio.shape[0] == 0:
+        return audio
+    window = audio[-max_trim:] if audio.shape[0] > max_trim else audio
+    above = (window.abs() > _SILENCE_TRIM_AMPLITUDE_THRESHOLD).nonzero(as_tuple=True)[0]
+    cut = (
+        window.shape[0]
+        if above.numel() == 0
+        else window.shape[0] - 1 - above[-1].item()
+    )
+    return audio[: audio.shape[0] - cut] if cut > 0 else audio
+
+
+def _trim_leading_near_silence(audio: torch.Tensor, max_trim: int) -> torch.Tensor:
+    """Strip near-silent samples from the start of `audio`, looking ahead at
+    most `max_trim` samples. Mirror of `_trim_trailing_near_silence`.
+    """
+    if max_trim <= 0 or audio.shape[0] == 0:
+        return audio
+    window = audio[:max_trim] if audio.shape[0] > max_trim else audio
+    above = (window.abs() > _SILENCE_TRIM_AMPLITUDE_THRESHOLD).nonzero(as_tuple=True)[0]
+    cut = window.shape[0] if above.numel() == 0 else above[0].item()
+    return audio[cut:] if cut > 0 else audio
+
+
+def _boundary_transition(
+    tail: torch.Tensor,
+    head: torch.Tensor,
+    fade_samples: int,
+    silence_samples: int,
+    trim_samples: int = 0,
+) -> tuple[list[torch.Tensor], torch.Tensor | None]:
+    """Compute the audio to emit at a chunk boundary, and the residual tail to
+    carry forward as the start of the *next* boundary's lookback window.
+
+    If `silence_samples` is 0, this is a gapless overlap-add: the trailing
+    `fade_samples` of `tail` are crossfaded into the leading `fade_samples` of
+    `head` using a Hann window, after spectral envelope smoothing to reduce
+    the "noise quality" jump that a decoder state reset otherwise produces.
+
+    If `silence_samples` is > 0, a true silent gap is inserted instead: any
+    pre-existing near-silence at the end of `tail` / start of `head` is
+    trimmed first (up to `trim_samples`, so the gap length stays consistent
+    regardless of how much trailing silence the model happened to generate),
+    then `tail` is faded down to silence, followed by `silence_samples` of
+    silence, followed by `head` fading up from silence. Fading into real
+    silence on both sides is inherently discontinuity-free (no unrelated
+    spectra are blended together), so spectral smoothing isn't needed in this
+    mode.
+    """
+    if silence_samples > 0 and trim_samples > 0:
+        tail = _trim_trailing_near_silence(tail, trim_samples)
+        head = _trim_leading_near_silence(head, trim_samples)
+
+    n = min(fade_samples, tail.shape[0], head.shape[0])
+    pieces: list[torch.Tensor] = []
+    if tail.shape[0] > n:
+        pieces.append(tail[:-n] if n > 0 else tail)
+
+    if silence_samples > 0:
+        if n > 0:
+            fade_out = _make_hann_fade_window(n, device=tail.device, dtype=tail.dtype)
+            pieces.append(tail[-n:] * (1 - fade_out))
+        pieces.append(
+            torch.zeros(silence_samples, device=head.device, dtype=head.dtype)
+        )
+        if n > 0:
+            fade_in = _make_hann_fade_window(n, device=head.device, dtype=head.dtype)
+            pieces.append(head[:n] * fade_in)
+        new_tail = head[n:] if head.shape[0] > n else None
+    elif n > 0:
+        tail_smooth, head_smooth = _smooth_spectral_envelope(tail, head, n)
+        fade_in = _make_hann_fade_window(n, device=head.device, dtype=head.dtype)
+        pieces.append(tail_smooth[-n:] * (1 - fade_in) + head_smooth[:n] * fade_in)
+        new_tail = head[n:] if head.shape[0] > n else None
+    else:
+        new_tail = head
+
+    return pieces, new_tail
+
+
+def _crossfade_concatenated_streams(
+    streams,
+    crossfade_samples: int,
+    silence_samples: int | list[int] = 0,
+    trim_samples: int = 0,
+):
     """Concatenate a sequence of audio-chunk generators into a single stream.
 
     Chunks within a sub-stream are passed through unchanged. Only the boundary
-    between one sub-stream and the next is treated specially: the trailing
-    `crossfade_samples` samples produced so far are crossfaded into the leading
-    samples of the next sub-stream using a smooth Hann window (not linear) and
-    spectral envelope smoothing to mask the discontinuity that appears at those
-    boundaries because each sub-stream is decoded with a freshly reset decoder state.
+    between one sub-stream and the next is treated specially, via
+    `_boundary_transition`: either a gapless Hann-windowed crossfade (with
+    spectral envelope smoothing) or a true silent gap bounded by fades to/from
+    silence, depending on whether that boundary's silence amount is 0.
 
-    Improvements over simple linear crossfade:
-    - Hann-windowed fade curves for smoother perceptual transitions
-    - STFT-based spectral envelope smoothing to reduce "noise quality" jumps
+    `silence_samples` can be a single value applied to every boundary, or a
+    list with one entry per boundary (i.e. `len(list(streams)) - 1` entries)
+    for a per-boundary pause length. `trim_samples` bounds how much
+    pre-existing near-silence around each boundary is trimmed before the gap
+    is inserted - see `_boundary_transition`.
     """
-    tail = None  # trailing samples produced so far, held back for a possible crossfade
+    tail = None  # trailing samples produced so far, held back for the next boundary
+    # The lookback buffer needs to be large enough for both the crossfade
+    # fade window and the silence-trim search window; the smaller of the two
+    # boundary transitions ("full window arrived" vs. "stream ended early")
+    # still fires correctly on the same amount of buffered audio.
+    lookback_samples = max(crossfade_samples, trim_samples)
 
-    for stream in streams:
-        needed = crossfade_samples if tail is not None else 0
+    for boundary_idx, stream in enumerate(streams):
+        boundary_silence = (
+            silence_samples[boundary_idx - 1]
+            if isinstance(silence_samples, (list, tuple))
+            else silence_samples
+        )
+        # Even with crossfade and trimming both disabled, a nonzero silence
+        # gap still needs to probe at least one sample past the boundary to
+        # trigger `_boundary_transition`.
+        needed = 0
+        if tail is not None:
+            needed = lookback_samples or (1 if boundary_silence > 0 else 0)
         boundary_chunks = []
         boundary_len = 0
 
@@ -1439,45 +1623,27 @@ def _crossfade_concatenated_streams(streams, crossfade_samples: int):
                 if boundary_len < needed:
                     continue
                 head = torch.cat(boundary_chunks)
-                n = min(needed, tail.shape[0])
-
-                # Apply spectral envelope smoothing before amplitude blending
-                tail_smooth, head_smooth = _smooth_spectral_envelope(tail, head, n)
-
-                # Use Hann window fade instead of linear for smoother transition
-                fade_in = _make_hann_fade_window(
-                    n, device=head.device, dtype=head.dtype
+                pieces, tail = _boundary_transition(
+                    tail, head, crossfade_samples, boundary_silence, trim_samples
                 )
-                blended = tail_smooth[-n:] * (1 - fade_in) + head_smooth[:n] * fade_in
-                if tail.shape[0] > n:
-                    yield tail[:-n]
-                yield blended
-                tail = head[n:] if head.shape[0] > n else None
+                yield from pieces
                 needed = 0
                 continue
 
             tail = piece if tail is None else torch.cat([tail, piece])
-            if tail.shape[0] > crossfade_samples:
-                cut = tail.shape[0] - crossfade_samples
+            if tail.shape[0] > lookback_samples:
+                cut = tail.shape[0] - lookback_samples
                 yield tail[:cut]
                 tail = tail[cut:]
 
         if needed > 0 and boundary_chunks:
             # The sub-stream ended before enough samples arrived to fill a full
-            # crossfade window; blend with however much we got.
+            # boundary window; transition with however much we got.
             head = torch.cat(boundary_chunks)
-            n = min(needed, tail.shape[0], head.shape[0])
-
-            # Apply spectral envelope smoothing before amplitude blending
-            tail_smooth, head_smooth = _smooth_spectral_envelope(tail, head, n)
-
-            # Use Hann window fade instead of linear for smoother transition
-            fade_in = _make_hann_fade_window(n, device=head.device, dtype=head.dtype)
-            blended = tail_smooth[-n:] * (1 - fade_in) + head_smooth[:n] * fade_in
-            if tail.shape[0] > n:
-                yield tail[:-n]
-            yield blended
-            tail = head[n:] if head.shape[0] > n else None
+            pieces, tail = _boundary_transition(
+                tail, head, crossfade_samples, boundary_silence, trim_samples
+            )
+            yield from pieces
 
     if tail is not None and tail.shape[0] > 0:
         yield tail
