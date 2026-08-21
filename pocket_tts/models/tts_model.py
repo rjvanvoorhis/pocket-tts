@@ -34,7 +34,11 @@ from pocket_tts.models.mimi import MimiModel
 from pocket_tts.modules import transformer
 from pocket_tts.modules.dummy_quantizer import DummyQuantizer
 from pocket_tts.modules.seanet import SEANetDecoder, SEANetEncoder
-from pocket_tts.modules.stateful_module import StatefulModule, increment_steps, init_states
+from pocket_tts.modules.stateful_module import (
+    StatefulModule,
+    increment_steps,
+    init_states,
+)
 from pocket_tts.quantization import RECOMMENDED_CONFIG, apply_dynamic_int8
 from pocket_tts.utils.config import CONFIGS_DIR, Config, load_config
 from pocket_tts.utils.utils import (
@@ -168,8 +172,12 @@ class TTSModel(nn.Module):
         encoder = SEANetEncoder(**mimi_config["seanet"])
         decoder = SEANetDecoder(**mimi_config["seanet"])
 
-        encoder_transformer = transformer.ProjectedTransformer(**mimi_config["transformer"])
-        decoder_transformer = transformer.ProjectedTransformer(**mimi_config["transformer"])
+        encoder_transformer = transformer.ProjectedTransformer(
+            **mimi_config["transformer"]
+        )
+        decoder_transformer = transformer.ProjectedTransformer(
+            **mimi_config["transformer"]
+        )
         quantizer = DummyQuantizer(**mimi_config["quantizer"])
 
         tts_model.mimi = MimiModel(
@@ -194,7 +202,9 @@ class TTSModel(nn.Module):
                     "If you specify mimi.weights_path you should specify flow_lm.weights_path"
                 )
             logger.info(f"Loading Mimi weights from {config.mimi.weights_path}")
-            mimi_state = get_mimi_state_dict(download_if_necessary(config.mimi.weights_path))
+            mimi_state = get_mimi_state_dict(
+                download_if_necessary(config.mimi.weights_path)
+            )
             tts_model.mimi.load_state_dict(mimi_state, strict=True)
 
         tts_model.mimi.eval()
@@ -205,7 +215,9 @@ class TTSModel(nn.Module):
                 weights_file = download_if_necessary(config.weights_path)
             except Exception:
                 tts_model.has_voice_cloning = False
-                weights_file = download_if_necessary(config.weights_path_without_voice_cloning)
+                weights_file = download_if_necessary(
+                    config.weights_path_without_voice_cloning
+                )
 
             state_dict = safetensors.torch.load_file(weights_file)
             tts_model.load_state_dict(state_dict, strict=True)
@@ -311,7 +323,12 @@ class TTSModel(nn.Module):
         logger.info(f"Loading model from config at {config_path}...")
 
         tts_model = TTSModel._from_pydantic_config_with_weights(
-            config, temp, lsd_decode_steps, noise_clamp, eos_threshold, origin=config_path
+            config,
+            temp,
+            lsd_decode_steps,
+            noise_clamp,
+            eos_threshold,
+            origin=config_path,
         )
 
         if quantize:
@@ -328,14 +345,20 @@ class TTSModel(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """First one is the backbone output, second one is the audio decoding output."""
         if text_tokens is None:
-            text_tokens = torch.zeros((1, 0), dtype=torch.int64, device=self.flow_lm.device)
+            text_tokens = torch.zeros(
+                (1, 0), dtype=torch.int64, device=self.flow_lm.device
+            )
         if backbone_input_latents is None:
             backbone_input_latents = torch.empty(
-                (1, 0, self.flow_lm.ldim), dtype=self.flow_lm.dtype, device=self.flow_lm.device
+                (1, 0, self.flow_lm.ldim),
+                dtype=self.flow_lm.dtype,
+                device=self.flow_lm.device,
             )
         if audio_conditioning is None:
             audio_conditioning = torch.empty(
-                (1, 0, self.flow_lm.dim), dtype=self.flow_lm.dtype, device=self.flow_lm.device
+                (1, 0, self.flow_lm.dim),
+                dtype=self.flow_lm.dtype,
+                device=self.flow_lm.device,
             )
 
         output = self._run_flow_lm(
@@ -345,7 +368,9 @@ class TTSModel(nn.Module):
             audio_conditioning=audio_conditioning,
         )
         increment_by = (
-            text_tokens.shape[1] + backbone_input_latents.shape[1] + audio_conditioning.shape[1]
+            text_tokens.shape[1]
+            + backbone_input_latents.shape[1]
+            + audio_conditioning.shape[1]
         )
         increment_steps(self.flow_lm, model_state, increment=increment_by)
         return output
@@ -375,7 +400,9 @@ class TTSModel(nn.Module):
         mimi_state = init_states(self.mimi, batch_size=1, sequence_length=10000)
         resored_audio = self.mimi.decode_from_latent(encoded, mimi_state)
         scipy.io.wavfile.write(filename, self.sample_rate, resored_audio.numpy())
-        logger.info("Saved restored audio from Mimi encoding to %s for debugging", filename)
+        logger.info(
+            "Saved restored audio from Mimi encoding to %s for debugging", filename
+        )
 
     def _encode_audio(self, audio: torch.Tensor) -> torch.Tensor:
         encoded = self.mimi.encode_to_latent(audio)
@@ -404,8 +431,12 @@ class TTSModel(nn.Module):
         Returns:
             torch.Tensor: Latents of shape [1, T, ldim].
         """
-        mimi_latent = self.mimi.encode_to_latent(audio_conditioning.unsqueeze(0).to(self.device))
-        return (mimi_latent.to(self.flow_lm.dtype) - self.flow_lm.emb_mean) / self.flow_lm.emb_std
+        mimi_latent = self.mimi.encode_to_latent(
+            audio_conditioning.unsqueeze(0).to(self.device)
+        )
+        return (
+            mimi_latent.to(self.flow_lm.dtype) - self.flow_lm.emb_mean
+        ) / self.flow_lm.emb_std
 
     def _expand_kv_cache(self, model_state: dict, sequence_length: int) -> None:
         """Expand KV cache back to full sequence_length for generation.
@@ -461,17 +492,25 @@ class TTSModel(nn.Module):
         """Worker thread function for decoding audio latents from queue with immediate streaming."""
         try:
             audio_chunks = []
-            mimi_state = init_states(self.mimi, batch_size=1, sequence_length=mimi_sequence_length)
+            mimi_state = init_states(
+                self.mimi, batch_size=1, sequence_length=mimi_sequence_length
+            )
             while True:
                 latent = latents_queue.get()
                 if latent is None:
                     break
-                mimi_decoding_input = latent * self.flow_lm.emb_std + self.flow_lm.emb_mean
+                mimi_decoding_input = (
+                    latent * self.flow_lm.emb_std + self.flow_lm.emb_mean
+                )
 
                 t = time.monotonic()
-                audio_frame = self.mimi.decode_from_latent(mimi_decoding_input, mimi_state)
+                audio_frame = self.mimi.decode_from_latent(
+                    mimi_decoding_input, mimi_state
+                )
                 increment_steps(self.mimi, mimi_state, increment=mimi_steps_per_latent)
-                audio_frame_duration = audio_frame.shape[2] / self.config.mimi.sample_rate
+                audio_frame_duration = (
+                    audio_frame.shape[2] / self.config.mimi.sample_rate
+                )
                 # We could log the timings here.
                 logger.debug(
                     " " * 30 + "Decoded %d ms of audio with mimi in %d ms",
@@ -667,8 +706,11 @@ class TTSModel(nn.Module):
         def short_text_streams():
             previous_chunk_text = None
             previous_chunk_audio = None
-            for chunk in chunks:
-                if chunk_conditioning == "teacher_forcing" and previous_chunk_audio is not None:
+            for chunk_idx, chunk in enumerate(chunks):
+                if (
+                    chunk_conditioning == "teacher_forcing"
+                    and previous_chunk_audio is not None
+                ):
                     # Re-process the immediately preceding chunk's text
                     # alongside this one so the model has read-ahead context,
                     # but always starting fresh from the original voice
@@ -680,12 +722,27 @@ class TTSModel(nn.Module):
                     text_for_generation = chunk
                     teacher_force_audio = None
 
+                # Log progress for multi-chunk generation
+                if len(chunks) > 1:
+                    progress_pct = (chunk_idx + 1) * 100 // len(chunks)
+                    logger.info(
+                        "Processing chunk %d/%d (%d%% complete): %.60s...",
+                        chunk_idx + 1,
+                        len(chunks),
+                        progress_pct,
+                        chunk.strip()[:60],
+                    )
+
                 prepared_text, frames_after_eos_guess = prepare_text_prompt(
-                    text_for_generation, self.pad_with_spaces_for_short_inputs, self.remove_semicolons
+                    text_for_generation,
+                    self.pad_with_spaces_for_short_inputs,
+                    self.remove_semicolons,
                 )
                 frames_after_eos_guess += 2
                 effective_frames = (
-                    frames_after_eos if frames_after_eos is not None else frames_after_eos_guess
+                    frames_after_eos
+                    if frames_after_eos is not None
+                    else frames_after_eos_guess
                 )
                 stream = self._generate_audio_stream_short_text(
                     model_state=model_state,
@@ -714,7 +771,9 @@ class TTSModel(nn.Module):
             return
 
         crossfade_samples = int(crossfade_duration * self.sample_rate)
-        yield from _crossfade_concatenated_streams(short_text_streams(), crossfade_samples)
+        yield from _crossfade_concatenated_streams(
+            short_text_streams(), crossfade_samples
+        )
 
     @torch.no_grad
     def _generate_audio_stream_short_text(
@@ -747,7 +806,12 @@ class TTSModel(nn.Module):
         # Start decoder worker thread
         decoder_thread = threading.Thread(
             target=self._decode_audio_worker,
-            args=(latents_queue, result_queue, mimi_sequence_length, mimi_steps_per_latent),
+            args=(
+                latents_queue,
+                result_queue,
+                mimi_sequence_length,
+                mimi_steps_per_latent,
+            ),
             daemon=True,
         )
         logger.info("starting timer now!")
@@ -827,7 +891,11 @@ class TTSModel(nn.Module):
         def run_generation():
             try:
                 self._autoregressive_generation(
-                    model_state, max_gen_len, frames_after_eos, latents_queue, forced_latents
+                    model_state,
+                    max_gen_len,
+                    frames_after_eos,
+                    latents_queue,
+                    forced_latents,
                 )
             except Exception as e:
                 logger.error(f"Error in autoregressive generation: {e}")
@@ -875,13 +943,18 @@ class TTSModel(nn.Module):
         steps_times = []
         eos_step = None
         for generation_step in range(max_gen_len):
-            with display_execution_time("Generating latent", print_output=False) as timer:
+            with display_execution_time(
+                "Generating latent", print_output=False
+            ) as timer:
                 next_latent, is_eos = self._run_flow_lm_and_increment_step(
                     model_state=model_state, backbone_input_latents=backbone_input
                 )
                 if is_eos.item() and eos_step is None:
                     eos_step = generation_step
-                if eos_step is not None and generation_step >= eos_step + frames_after_eos:
+                if (
+                    eos_step is not None
+                    and generation_step >= eos_step + frames_after_eos
+                ):
                     break
 
                 # Add generated latent to queue for immediate decoding
@@ -897,7 +970,9 @@ class TTSModel(nn.Module):
 
         # Add sentinel value to signal end of generation
         latents_queue.put(None)
-        logger.info("Average generation step time: %d ms", int(statistics.mean(steps_times)))
+        logger.info(
+            "Average generation step time: %d ms", int(statistics.mean(steps_times))
+        )
 
     @lru_cache(maxsize=2)
     def _cached_get_state_for_audio_prompt(
@@ -976,7 +1051,9 @@ class TTSModel(nn.Module):
                 )
             return _import_model_state(
                 download_if_necessary(
-                    get_predefined_voice(language=self.origin.stem, name=audio_conditioning)
+                    get_predefined_voice(
+                        language=self.origin.stem, name=audio_conditioning
+                    )
                 ),
                 self.device,
             )
@@ -1003,7 +1080,9 @@ class TTSModel(nn.Module):
                 max_samples = int(30 * conditioning_sample_rate)  # 30 seconds of audio
                 if audio.shape[-1] > max_samples:
                     audio = audio[..., :max_samples]
-                    logger.info(f"Audio truncated to first 30 seconds ({max_samples} samples)")
+                    logger.info(
+                        f"Audio truncated to first 30 seconds ({max_samples} samples)"
+                    )
 
             audio_conditioning = convert_audio(
                 audio, conditioning_sample_rate, self.config.mimi.sample_rate, 1
@@ -1015,19 +1094,26 @@ class TTSModel(nn.Module):
         if self.flow_lm.insert_bos_before_voice:
             prompt = torch.cat([self.flow_lm.bos_before_voice, prompt], dim=1)
 
-        model_state = init_states(self.flow_lm, batch_size=1, sequence_length=prompt.shape[1])
+        model_state = init_states(
+            self.flow_lm, batch_size=1, sequence_length=prompt.shape[1]
+        )
 
         with display_execution_time("Prompting audio"):
-            self._run_flow_lm_and_increment_step(model_state=model_state, audio_conditioning=prompt)
+            self._run_flow_lm_and_increment_step(
+                model_state=model_state, audio_conditioning=prompt
+            )
 
         logger.info(
-            "Size of the model state for audio prompt: %d MB", size_of_dict(model_state) // 1e6
+            "Size of the model state for audio prompt: %d MB",
+            size_of_dict(model_state) // 1e6,
         )
 
         return model_state
 
     def _estimate_max_gen_len(self, token_count: int) -> int:
-        gen_len_sec = token_count / self._TOKENS_PER_SECOND_ESTIMATE + self._GEN_SECONDS_PADDING
+        gen_len_sec = (
+            token_count / self._TOKENS_PER_SECOND_ESTIMATE + self._GEN_SECONDS_PADDING
+        )
         frame_rate = self.config.mimi.frame_rate
         return math.ceil(gen_len_sec * frame_rate)
 
@@ -1064,7 +1150,9 @@ def prepare_text_prompt(
     return text, frames_after_eos_guess
 
 
-def _find_boundary_indices(list_of_tokens: list[int], boundary_tokens: list[int]) -> list[int]:
+def _find_boundary_indices(
+    list_of_tokens: list[int], boundary_tokens: list[int]
+) -> list[int]:
     """Find token indices where text should be split based on boundary tokens.
 
     Returns a list of boundary positions used to slice segments. Each consecutive
@@ -1097,7 +1185,9 @@ def _segments_from_boundaries(
     return segments
 
 
-def _hard_split_on_words(tokenizer, text: str, max_tokens: int) -> list[tuple[int, str]]:
+def _hard_split_on_words(
+    tokenizer, text: str, max_tokens: int
+) -> list[tuple[int, str]]:
     """Last-resort split for a chunk with no comma/semicolon/colon to break on.
 
     Packs whole words greedily, cutting to a new segment whenever the next
@@ -1153,7 +1243,9 @@ def split_into_best_sentences(
         else:
             sub_tokens = tokenizer(text.strip()).tokens[0].tolist()
             sub_boundaries = _find_boundary_indices(sub_tokens, fallback_tokens)
-            sub_segments = _segments_from_boundaries(sub_tokens, sub_boundaries, tokenizer)
+            sub_segments = _segments_from_boundaries(
+                sub_tokens, sub_boundaries, tokenizer
+            )
             if len(sub_segments) > 1:
                 refined_segments.extend(sub_segments)
             else:
@@ -1169,7 +1261,9 @@ def split_into_best_sentences(
         if nb_tokens <= max_tokens:
             final_segments.append((nb_tokens, text))
         else:
-            final_segments.extend(_hard_split_on_words(tokenizer, text.strip(), max_tokens))
+            final_segments.extend(
+                _hard_split_on_words(tokenizer, text.strip(), max_tokens)
+            )
     refined_segments = final_segments
 
     max_nb_tokens_in_a_chunk = max_tokens
@@ -1230,7 +1324,9 @@ def _make_hann_fade_window(n: int, device, dtype) -> torch.Tensor:
     return 0.5 * (1 - torch.cos(math.pi * i / (n - 1)))
 
 
-def _smooth_spectral_envelope(tail: torch.Tensor, head: torch.Tensor, n: int) -> tuple[torch.Tensor, torch.Tensor]:
+def _smooth_spectral_envelope(
+    tail: torch.Tensor, head: torch.Tensor, n: int
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Smooth spectral envelope at chunk boundary using STFT analysis.
 
     Analyzes the magnitude spectrum near the boundary and blends them to reduce
@@ -1276,22 +1372,19 @@ def _smooth_spectral_envelope(tail: torch.Tensor, head: torch.Tensor, n: int) ->
 
         # Blend magnitudes smoothly: head's phase with blended magnitude
         # This reduces spectral discontinuity while preserving prosody
-        fade = torch.linspace(0, 1, tail_mag.shape[0], device=tail.device, dtype=tail.dtype)
+        fade = torch.linspace(
+            0, 1, tail_mag.shape[0], device=tail.device, dtype=tail.dtype
+        )
         blended_mag = tail_mag * (1 - fade) + head_mag * fade
 
         # Reconstruct: use blended magnitude + head's phase
         blended_fft = blended_mag * torch.exp(1j * head_phase)
         blended_time = torch.fft.irfft(blended_fft, n=fft_size)
 
-        # Create fade envelope and apply to head segment
-        # This smoothly transitions from tail to head using spectral blending
-        window = torch.hann_window(n, periodic=False, device=head.device, dtype=head.dtype)
-        spectral_fade = torch.linspace(0, 1, n, device=head.device, dtype=head.dtype)
-
         # Blend: weight the spectrally smoothed version into the original head
         # The longer the crossfade, the more blending. Use head_seg as base and blend in
         smoothed_head = head_seg.clone()
-        
+
         # Apply spectral envelope from blended spectrum at the start of the segment
         if blended_time.shape[0] >= n:
             # Blend with the start of the reconstructed audio
@@ -1302,7 +1395,9 @@ def _smooth_spectral_envelope(tail: torch.Tensor, head: torch.Tensor, n: int) ->
 
         # Weight the spectral component in, scaled by envelope
         blend_weight = 0.3  # Balance between original and spectrally smoothed (30% smooth, 70% original)
-        smoothed_head = (1 - blend_weight) * head_seg + blend_weight * spectral_component
+        smoothed_head = (
+            1 - blend_weight
+        ) * head_seg + blend_weight * spectral_component
 
         smoothed_tail = tail_seg  # Keep tail unchanged, only smooth the head
 
@@ -1322,7 +1417,7 @@ def _crossfade_concatenated_streams(streams, crossfade_samples: int):
     samples of the next sub-stream using a smooth Hann window (not linear) and
     spectral envelope smoothing to mask the discontinuity that appears at those
     boundaries because each sub-stream is decoded with a freshly reset decoder state.
-    
+
     Improvements over simple linear crossfade:
     - Hann-windowed fade curves for smoother perceptual transitions
     - STFT-based spectral envelope smoothing to reduce "noise quality" jumps
@@ -1345,12 +1440,14 @@ def _crossfade_concatenated_streams(streams, crossfade_samples: int):
                     continue
                 head = torch.cat(boundary_chunks)
                 n = min(needed, tail.shape[0])
-                
+
                 # Apply spectral envelope smoothing before amplitude blending
                 tail_smooth, head_smooth = _smooth_spectral_envelope(tail, head, n)
-                
+
                 # Use Hann window fade instead of linear for smoother transition
-                fade_in = _make_hann_fade_window(n, device=head.device, dtype=head.dtype)
+                fade_in = _make_hann_fade_window(
+                    n, device=head.device, dtype=head.dtype
+                )
                 blended = tail_smooth[-n:] * (1 - fade_in) + head_smooth[:n] * fade_in
                 if tail.shape[0] > n:
                     yield tail[:-n]
@@ -1370,10 +1467,10 @@ def _crossfade_concatenated_streams(streams, crossfade_samples: int):
             # crossfade window; blend with however much we got.
             head = torch.cat(boundary_chunks)
             n = min(needed, tail.shape[0], head.shape[0])
-            
+
             # Apply spectral envelope smoothing before amplitude blending
             tail_smooth, head_smooth = _smooth_spectral_envelope(tail, head, n)
-            
+
             # Use Hann window fade instead of linear for smoother transition
             fade_in = _make_hann_fade_window(n, device=head.device, dtype=head.dtype)
             blended = tail_smooth[-n:] * (1 - fade_in) + head_smooth[:n] * fade_in
