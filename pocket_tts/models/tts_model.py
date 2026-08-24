@@ -23,6 +23,7 @@ from pocket_tts.data.audio import audio_read
 from pocket_tts.data.audio_utils import convert_audio
 from pocket_tts.default_parameters import (
     DEFAULT_CROSSFADE_DURATION_S,
+    DEFAULT_DIALOGUE_SILENCE_DURATION_S,
     DEFAULT_EOS_THRESHOLD,
     DEFAULT_LANGUAGE,
     DEFAULT_LSD_DECODE_STEPS,
@@ -814,6 +815,92 @@ class TTSModel(nn.Module):
         )
 
     @torch.no_grad
+    def generate_dialogue_stream(
+        self,
+        turns: list[tuple[dict, str]],
+        max_tokens: int = MAX_TOKEN_PER_CHUNK,
+        frames_after_eos: int | None = None,
+        copy_state: bool = True,
+        crossfade_duration: float = DEFAULT_CROSSFADE_DURATION_S,
+        silence_duration: float = DEFAULT_SILENCE_DURATION_S,
+        turn_silence_duration: float = DEFAULT_DIALOGUE_SILENCE_DURATION_S,
+        chunk_conditioning: str = "independent",
+    ):
+        """Generate a stitched audio stream for a multi-speaker dialogue.
+
+        Each turn is generated independently (via `generate_audio_stream()`,
+        including its own internal sentence-boundary stitching if a turn's
+        text spans multiple sentences), then turns are stitched together the
+        same way sentence chunks are: a Hann-windowed crossfade around a
+        silence gap, via `_crossfade_concatenated_streams()`. Without this,
+        concatenating separately-generated per-speaker clips produces an
+        audible raw cut at every speaker change, on top of each clip
+        potentially having a different reference loudness.
+
+        Args:
+            turns: Ordered list of (model_state, text) pairs, one per
+                dialogue turn. Each model_state selects that turn's voice -
+                typically built once per speaker via
+                `get_state_for_audio_prompt()` (or
+                `get_state_for_blended_audio_prompts()`) and reused across
+                that speaker's turns.
+            max_tokens, frames_after_eos, copy_state, crossfade_duration,
+                silence_duration, chunk_conditioning: Forwarded to
+                `generate_audio_stream()` for each turn - see there for
+                details.
+            turn_silence_duration: Duration, in seconds, of true silence
+                inserted between turns (i.e. at speaker changes), as opposed
+                to `silence_duration` which applies to sentence boundaries
+                within a single turn. Conversational turn-taking paces
+                differently from narration, so this is independently
+                tunable.
+
+        Yields:
+            torch.Tensor: Audio chunks with shape [samples], same as
+                `generate_audio_stream()`.
+        """
+        if not turns:
+            return
+
+        if len(turns) == 1:
+            model_state, text = turns[0]
+            yield from self.generate_audio_stream(
+                model_state=model_state,
+                text_to_generate=text,
+                max_tokens=max_tokens,
+                frames_after_eos=frames_after_eos,
+                copy_state=copy_state,
+                crossfade_duration=crossfade_duration,
+                silence_duration=silence_duration,
+                chunk_conditioning=chunk_conditioning,
+            )
+            return
+
+        def per_turn_streams():
+            for model_state, text in turns:
+                yield self.generate_audio_stream(
+                    model_state=model_state,
+                    text_to_generate=text,
+                    max_tokens=max_tokens,
+                    frames_after_eos=frames_after_eos,
+                    copy_state=copy_state,
+                    crossfade_duration=crossfade_duration,
+                    silence_duration=silence_duration,
+                    chunk_conditioning=chunk_conditioning,
+                )
+
+        turn_crossfade_samples = int(crossfade_duration * self.sample_rate)
+        turn_silence_samples = int(turn_silence_duration * self.sample_rate)
+        trim_samples = (
+            int(_MAX_SILENCE_TRIM_S * self.sample_rate)
+            if turn_silence_samples > 0
+            else 0
+        )
+        yield from _crossfade_concatenated_streams(
+            per_turn_streams(), turn_crossfade_samples, turn_silence_samples, trim_samples
+        )
+
+    @torch.no_grad
     def _generate_audio_stream_short_text(
         self,
         model_state: dict,
@@ -1111,6 +1198,17 @@ class TTSModel(nn.Module):
         if not self.has_voice_cloning and isinstance(audio_conditioning, (str, Path)):
             raise ValueError(VOICE_CLONING_UNSUPPORTED)
 
+        conditioning = self._conditioning_from_audio(audio_conditioning, truncate)
+        return self._state_from_conditioning(conditioning)
+
+    def _conditioning_from_audio(
+        self, audio_conditioning: Path | torch.Tensor, truncate: bool
+    ) -> torch.Tensor:
+        """Load (if needed) and Mimi-encode a single raw audio prompt into the
+        flow LM's conditioning space - the `prompt` tensor consumed by
+        `_state_from_conditioning()`. Shared by `get_state_for_audio_prompt()`
+        and `get_state_for_blended_audio_prompts()`.
+        """
         if isinstance(audio_conditioning, Path):
             audio, conditioning_sample_rate = audio_read(audio_conditioning)
 
@@ -1127,8 +1225,13 @@ class TTSModel(nn.Module):
             )
 
         with display_execution_time("Encoding audio prompt"):
-            prompt = self._encode_audio(audio_conditioning.unsqueeze(0).to(self.device))
+            return self._encode_audio(audio_conditioning.unsqueeze(0).to(self.device))
 
+    def _state_from_conditioning(self, prompt: torch.Tensor) -> dict:
+        """Prime a fresh model_state by running `prompt` (an audio conditioning
+        tensor from `_conditioning_from_audio()`, or a blend of several)
+        through the flow LM.
+        """
         if self.flow_lm.insert_bos_before_voice:
             prompt = torch.cat([self.flow_lm.bos_before_voice, prompt], dim=1)
 
@@ -1147,6 +1250,100 @@ class TTSModel(nn.Module):
         )
 
         return model_state
+
+    @torch.no_grad
+    def get_state_for_blended_audio_prompts(
+        self,
+        audio_conditionings: list[Path | str | torch.Tensor],
+        weights: list[float] | None = None,
+        truncate: bool = False,
+    ) -> dict:
+        """Blend two or more voices into a single model_state by averaging
+        their Mimi-encoded conditioning latents before priming the flow LM.
+
+        This is a research spike: `model_state` is normally built by running
+        one voice's conditioning tensor through the flow LM to get a
+        streaming attention KV-cache, so there's no principled way to blend
+        two already-built states (different lengths, position-indexed cache
+        entries). Blending instead happens one step upstream, on the
+        conditioning tensors themselves (shape [1, T, D], the Mimi latents
+        projected into the flow LM's conditioning space) before that step -
+        a continuous space where interpolation is at least well-defined,
+        even though the flow LM has never seen an "in-between" prompt during
+        training.
+
+        Args:
+            audio_conditionings: Two or more raw audio sources to blend - each
+                a local path, a downloadable URL, a predefined voice name
+                (resolved to its origin audio, not its baked embedding), or a
+                pre-loaded tensor. Pre-baked .safetensors voice profiles are
+                rejected since they don't carry the underlying conditioning
+                audio needed to blend.
+            weights: Optional per-source weights (need not sum to 1). Defaults
+                to equal weights.
+            truncate: Whether to truncate long audio prompts to 30 seconds,
+                same as `get_state_for_audio_prompt()`.
+
+        Returns:
+            dict: A model_state usable exactly like one from
+                `get_state_for_audio_prompt()`.
+        """
+        if len(audio_conditionings) < 2:
+            raise ValueError("Blending requires at least 2 audio prompts.")
+        if weights is None:
+            weights = [1.0] * len(audio_conditionings)
+        if len(weights) != len(audio_conditionings):
+            raise ValueError(
+                "weights must have the same length as audio_conditionings."
+            )
+        total_weight = sum(weights)
+        if total_weight == 0:
+            raise ValueError("weights must not sum to 0.")
+
+        sources = [
+            self._resolve_blend_source(source) for source in audio_conditionings
+        ]
+        if not self.has_voice_cloning:
+            raise ValueError(VOICE_CLONING_UNSUPPORTED)
+
+        conditionings = [
+            self._conditioning_from_audio(source, truncate) for source in sources
+        ]
+
+        # Time-align by upsampling every source to the longest one, rather
+        # than cropping to the shortest - a first-pass choice to preserve as
+        # much of each source as possible; worth comparing against
+        # crop-to-shortest by ear if results sound smeared.
+        target_len = max(c.shape[1] for c in conditionings)
+        aligned = [
+            F.interpolate(
+                c.transpose(1, 2), size=target_len, mode="linear", align_corners=False
+            ).transpose(1, 2)
+            for c in conditionings
+        ]
+
+        blended = sum(c * (w / total_weight) for c, w in zip(aligned, weights))
+        return self._state_from_conditioning(blended)
+
+    def _resolve_blend_source(
+        self, source: Path | str | torch.Tensor
+    ) -> Path | torch.Tensor:
+        """Resolve one blend input down to a Path or Tensor of raw audio,
+        rejecting sources that don't carry raw conditioning audio.
+        """
+        if isinstance(source, str):
+            if source in _ORIGINS_OF_PREDEFINED_VOICES:
+                source = _ORIGINS_OF_PREDEFINED_VOICES[source]
+            source = download_if_necessary(source)
+
+        if isinstance(source, (str, Path)) and _is_safetensors_source(source):
+            raise ValueError(
+                f"Cannot blend {source!r}: pre-baked .safetensors voice "
+                "profiles don't carry the underlying conditioning audio "
+                "needed to blend. Use a raw audio path/URL or a predefined "
+                "voice name instead."
+            )
+        return source
 
     def _estimate_max_gen_len(self, token_count: int) -> int:
         gen_len_sec = (

@@ -15,13 +15,14 @@ import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from safetensors import safe_open
 from typing_extensions import Annotated
 
 from pocket_tts.data.audio import stream_audio_chunks
 from pocket_tts.default_parameters import (
     DEFAULT_CROSSFADE_DURATION_S,
+    DEFAULT_DIALOGUE_SILENCE_DURATION_S,
     DEFAULT_EOS_THRESHOLD,
     DEFAULT_FRAMES_AFTER_EOS,
     DEFAULT_LSD_DECODE_STEPS,
@@ -146,10 +147,16 @@ async def health():
     return {"status": "healthy"}
 
 
-def write_to_queue(
-    queue, text_to_generate, model_state, max_tokens: int, chunk_conditioning: str
-):
-    """Allows writing to the StreamingResponse as if it were a file."""
+def stream_wav_chunks_via_queue(audio_chunks_factory):
+    """Bridge a background-threaded audio-chunk generator into a synchronous
+    byte-yielding generator suitable for `StreamingResponse`.
+
+    `audio_chunks_factory` is called (with no arguments) on a background
+    thread and must return an iterable of audio chunk tensors - typically a
+    `TTSModel.generate_audio_stream(...)` or
+    `TTSModel.generate_dialogue_stream(...)` call. Shared by `/tts` and
+    `/dialogue` so both stream WAV bytes the same way.
+    """
 
     class FileLikeToQueue(io.IOBase):
         def __init__(self, queue):
@@ -164,39 +171,22 @@ def write_to_queue(
         def close(self):
             self.queue.put(None)
 
-    audio_chunks = tts_model.generate_audio_stream(
-        model_state=model_state,
-        text_to_generate=text_to_generate,
-        max_tokens=max_tokens,
-        chunk_conditioning=chunk_conditioning,
-    )
-    stream_audio_chunks(
-        FileLikeToQueue(queue), audio_chunks, tts_model.config.mimi.sample_rate
-    )
-
-
-def generate_data_with_state(
-    text_to_generate: str,
-    model_state: dict,
-    max_tokens: int,
-    chunk_conditioning: str,
-):
     queue = Queue()
 
-    # Run your function in a thread
-    thread = threading.Thread(
-        target=write_to_queue,
-        args=(queue, text_to_generate, model_state, max_tokens, chunk_conditioning),
-    )
+    def write_to_queue():
+        stream_audio_chunks(
+            FileLikeToQueue(queue),
+            audio_chunks_factory(),
+            tts_model.config.mimi.sample_rate,
+        )
+
+    thread = threading.Thread(target=write_to_queue)
     thread.start()
 
-    # Yield data as it becomes available
-    i = 0
     while True:
         data = queue.get()
         if data is None:
             break
-        i += 1
         yield data
 
     thread.join()
@@ -291,10 +281,125 @@ def text_to_speech(
         raise HTTPException(status_code=500, detail="This should never happen.")
 
     return StreamingResponse(
-        generate_data_with_state(text, model_state, max_tokens, chunk_conditioning),
+        stream_wav_chunks_via_queue(
+            lambda: tts_model.generate_audio_stream(
+                model_state=model_state,
+                text_to_generate=text,
+                max_tokens=max_tokens,
+                chunk_conditioning=chunk_conditioning,
+            )
+        ),
         media_type="audio/wav",
         headers={
             "Content-Disposition": "attachment; filename=generated_speech.wav",
+            "Transfer-Encoding": "chunked",
+        },
+    )
+
+
+# ------------------------------------------------------
+# Multi-speaker dialogue endpoint
+# ------------------------------------------------------
+
+
+class DialogueTurn(BaseModel):
+    speaker: str
+    text: str
+
+
+class DialogueRequest(BaseModel):
+    turns: list[DialogueTurn]
+    voices: dict[str, str] = Field(
+        description="Maps each speaker name appearing in `turns` to a "
+        "voice_url - same accepted formats as /tts's voice_url: a "
+        "predefined voice name, or an http://, https://, or hf:// URL."
+    )
+    max_tokens: int | None = None
+    chunk_conditioning: str | None = None
+    turn_silence_duration: float | None = Field(
+        None,
+        description="Duration, in seconds, of silence inserted between "
+        "turns (i.e. at speaker changes). Defaults to the server's "
+        "dialogue-tuned default, independent from same-speaker sentence "
+        "pauses.",
+    )
+    crossfade_duration: float | None = None
+
+
+def _resolve_voice_url_or_400(voice_url: str, speaker: str) -> dict:
+    if not (
+        voice_url.startswith("http://")
+        or voice_url.startswith("https://")
+        or voice_url.startswith("hf://")
+        or voice_url in _ORIGINS_OF_PREDEFINED_VOICES
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid voice_url for speaker {speaker!r}: must start with "
+            "http://, https://, or hf://, or be a predefined voice name",
+        )
+    return tts_model._cached_get_state_for_audio_prompt(voice_url)
+
+
+@web_app.post("/dialogue")
+def dialogue(request: DialogueRequest):
+    """Generate a stitched multi-speaker dialogue from an ordered list of
+    (speaker, text) turns, each speaker mapped to its own voice. See
+    TTSModel.generate_dialogue_stream() for how turn boundaries are stitched.
+    """
+    turns = [turn for turn in request.turns if turn.text.strip()]
+    if not turns:
+        raise HTTPException(status_code=400, detail="No non-empty turns to generate")
+
+    missing_speakers = sorted({t.speaker for t in turns} - request.voices.keys())
+    if missing_speakers:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No voice assigned for speaker(s): {missing_speakers}",
+        )
+
+    max_tokens = request.max_tokens or DEFAULT_MAX_TOKENS_PER_CHUNK
+    if max_tokens <= 0:
+        raise HTTPException(status_code=400, detail="max_tokens must be positive")
+
+    chunk_conditioning = request.chunk_conditioning or DEFAULT_CHUNK_CONDITIONING
+    if chunk_conditioning not in ("independent", "teacher_forcing"):
+        raise HTTPException(
+            status_code=400,
+            detail="chunk_conditioning must be 'independent' or 'teacher_forcing'",
+        )
+
+    turn_silence_duration = (
+        request.turn_silence_duration
+        if request.turn_silence_duration is not None
+        else DEFAULT_DIALOGUE_SILENCE_DURATION_S
+    )
+    crossfade_duration = (
+        request.crossfade_duration
+        if request.crossfade_duration is not None
+        else DEFAULT_CROSSFADE_DURATION_S
+    )
+
+    voice_states = {
+        speaker: _resolve_voice_url_or_400(voice_url, speaker)
+        for speaker, voice_url in request.voices.items()
+        if speaker in {t.speaker for t in turns}
+    }
+    resolved_turns = [(voice_states[t.speaker], t.text) for t in turns]
+
+    return StreamingResponse(
+        stream_wav_chunks_via_queue(
+            lambda: tts_model.generate_dialogue_stream(
+                turns=resolved_turns,
+                max_tokens=max_tokens,
+                chunk_conditioning=chunk_conditioning,
+                turn_silence_duration=turn_silence_duration,
+                crossfade_duration=crossfade_duration,
+            )
+        ),
+        media_type="audio/wav",
+        headers={
+            "Content-Disposition": "attachment; filename=dialogue.wav",
             "Transfer-Encoding": "chunked",
         },
     )
@@ -346,6 +451,65 @@ def create_voice(
         )
     finally:
         os.unlink(temp_file_path)
+
+    voice_id = uuid.uuid4().hex
+    dest_path = VOICES_DIR / f"{voice_id}.safetensors"
+    export_model_state(model_state, dest_path, metadata={"id": voice_id, "name": name})
+
+    return VoiceRecord(id=voice_id, name=name)
+
+
+@web_app.post("/voices/blend", response_model=VoiceRecord, status_code=201)
+def blend_voice(
+    name: str = Form(...),
+    voice_wavs: list[UploadFile] = File(...),
+    weights: str | None = Form(
+        None,
+        description="Optional comma-separated per-file weights (e.g. '0.7,0.3'), "
+        "same order as voice_wavs. Defaults to equal weights.",
+    ),
+):
+    """Blend two or more audio samples into a new voice profile, by averaging
+    their conditioning latents before priming the model state. Experimental -
+    see TTSModel.get_state_for_blended_audio_prompts()."""
+    if not name.strip():
+        raise HTTPException(status_code=400, detail="Name cannot be empty")
+    if len(voice_wavs) < 2:
+        raise HTTPException(
+            status_code=400, detail="Blending requires at least 2 audio files"
+        )
+
+    parsed_weights = None
+    if weights and weights.strip():
+        try:
+            parsed_weights = [float(w) for w in weights.split(",")]
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail="weights must be a comma-separated list of numbers",
+            )
+        if len(parsed_weights) != len(voice_wavs):
+            raise HTTPException(
+                status_code=400, detail="weights must have one value per audio file"
+            )
+
+    temp_paths = []
+    try:
+        for voice_wav in voice_wavs:
+            suffix = Path(voice_wav.filename).suffix if voice_wav.filename else ".wav"
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
+                temp_file.write(voice_wav.file.read())
+                temp_file.flush()
+                temp_paths.append(Path(temp_file.name))
+
+        model_state = tts_model.get_state_for_blended_audio_prompts(
+            temp_paths, weights=parsed_weights, truncate=True
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        for temp_path in temp_paths:
+            os.unlink(temp_path)
 
     voice_id = uuid.uuid4().hex
     dest_path = VOICES_DIR / f"{voice_id}.safetensors"

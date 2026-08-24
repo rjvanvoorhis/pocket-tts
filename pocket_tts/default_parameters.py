@@ -15,6 +15,13 @@ DEFAULT_CROSSFADE_DURATION_S = 0.1
 # the next sentence starts abruptly. Set to 0 to fall back to a gapless
 # crossfade (the old behavior).
 DEFAULT_SILENCE_DURATION_S = 0.15
+# Duration, in seconds, of true silence inserted between turns in
+# generate_dialogue_stream(), analogous to DEFAULT_SILENCE_DURATION_S but for
+# speaker-turn boundaries rather than same-speaker sentence boundaries.
+# Conversational back-and-forth paces differently from narration, so this is
+# kept independently tunable rather than reusing DEFAULT_SILENCE_DURATION_S -
+# starts at the same value as a first guess, tune by ear from there.
+DEFAULT_DIALOGUE_SILENCE_DURATION_S = 0.15
 # Overridable via `serve --max-tokens` / the /tts `max_tokens` form field, and
 # the `generate --max-tokens` CLI option. 50 is a conservative default; some
 # models (e.g. english_2026-04) reportedly tolerate bigger chunks, but the
