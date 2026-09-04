@@ -102,6 +102,65 @@ def test_generate_audio_stream_rejects_unknown_chunk_conditioning():
         )
 
 
+def test_generate_dialogue_stream_empty_turns_yields_nothing():
+    assert list(TTSModel.generate_dialogue_stream(SimpleNamespace(), [])) == []
+
+
+def test_generate_dialogue_stream_single_turn_skips_stitching():
+    calls = []
+
+    def fake_generate_audio_stream(**kwargs):
+        calls.append(kwargs)
+        yield torch.tensor([1.0, 2.0])
+
+    model = SimpleNamespace(sample_rate=24000, generate_audio_stream=fake_generate_audio_stream)
+
+    chunks = list(
+        TTSModel.generate_dialogue_stream(model, [({"speaker": "a"}, "hi")])
+    )
+
+    # A single turn has no boundary to stitch, so it's passed straight
+    # through to generate_audio_stream with no extra silence/crossfade work.
+    assert len(calls) == 1
+    assert calls[0]["model_state"] == {"speaker": "a"}
+    assert calls[0]["text_to_generate"] == "hi"
+    assert [c.tolist() for c in chunks] == [[1.0, 2.0]]
+
+
+def test_generate_dialogue_stream_inserts_silence_at_speaker_change():
+    calls = []
+
+    def fake_generate_audio_stream(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            yield torch.full((100,), 1.0)
+        else:
+            yield torch.full((100,), 2.0)
+
+    model = SimpleNamespace(sample_rate=24000, generate_audio_stream=fake_generate_audio_stream)
+
+    chunks = list(
+        TTSModel.generate_dialogue_stream(
+            model,
+            [({"speaker": "a"}, "hi"), ({"speaker": "b"}, "there")],
+            crossfade_duration=0.0,
+            turn_silence_duration=0.01,
+        )
+    )
+
+    assert len(calls) == 2
+    assert calls[0]["model_state"] == {"speaker": "a"}
+    assert calls[1]["model_state"] == {"speaker": "b"}
+
+    audio = torch.cat(chunks)
+    # 100 samples of turn one, a 0.01s (240-sample) silence gap, then 100
+    # samples of turn two - a real gap at the speaker change, not a raw cut.
+    assert audio.shape[0] == 100 + 240 + 100
+    assert torch.all(audio[:100] == 1.0)
+    assert torch.all(audio[100:340] == 0.0)
+    assert torch.all(audio[340:] == 2.0)
+
+
 def test_generate_reports_autoregressive_errors_before_decoder_done():
     error = RuntimeError("generation failed")
 

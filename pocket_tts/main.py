@@ -1,4 +1,5 @@
 import io
+import json
 import logging
 import os
 import re
@@ -12,7 +13,7 @@ from queue import Queue
 
 import typer
 import uvicorn
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse
 from pydantic import BaseModel, Field
@@ -33,7 +34,7 @@ from pocket_tts.default_parameters import (
     get_default_text_for_language,
     get_default_voice_for_language,
 )
-from pocket_tts.models.tts_model import TTSModel, export_model_state
+from pocket_tts.models.tts_model import TTSModel, _import_model_state, export_model_state
 from pocket_tts.utils.logging_utils import enable_logging
 from pocket_tts.utils.utils import _ORIGINS_OF_PREDEFINED_VOICES
 
@@ -410,9 +411,74 @@ def dialogue(request: DialogueRequest):
 # ------------------------------------------------------
 
 
+GENDER_VALUES = ("male", "female", "ambiguous")
+
+
 class VoiceRecord(BaseModel):
     id: str
     name: str
+    gender: str | None = None
+    language: str | None = None
+    accent: str | None = None
+    tags: list[str] = []
+
+
+class VoiceUpdate(BaseModel):
+    """Partial update for a voice profile's metadata - name/tags/etc only,
+    never the underlying conditioning audio (delete and re-create for that).
+    Fields left unset (None) are left unchanged; to clear a field, pass an
+    empty string ("") or, for tags, an empty list.
+    """
+
+    name: str | None = None
+    gender: str | None = None
+    language: str | None = None
+    accent: str | None = None
+    tags: list[str] | None = None
+
+
+def _validate_gender(gender: str | None) -> str | None:
+    if not gender:
+        return None
+    gender = gender.strip().lower()
+    if gender not in GENDER_VALUES:
+        raise HTTPException(
+            status_code=400, detail=f"gender must be one of {GENDER_VALUES}"
+        )
+    return gender
+
+
+def _parse_tags_field(tags: str | None) -> list[str]:
+    """Parse a comma-separated `tags` form field (used by the multipart
+    create/blend endpoints) into a list, deduplicated and order-preserved."""
+    if not tags:
+        return []
+    seen: dict[str, None] = {}
+    for tag in tags.split(","):
+        tag = tag.strip()
+        if tag:
+            seen.setdefault(tag, None)
+    return list(seen)
+
+
+def _voice_metadata(
+    voice_id: str,
+    name: str,
+    gender: str | None,
+    language: str | None,
+    accent: str | None,
+    tags: list[str],
+) -> dict[str, str]:
+    metadata = {"id": voice_id, "name": name}
+    if gender:
+        metadata["gender"] = gender
+    if language:
+        metadata["language"] = language
+    if accent:
+        metadata["accent"] = accent
+    if tags:
+        metadata["tags"] = json.dumps(tags)
+    return metadata
 
 
 def _read_voice_record(path: Path) -> VoiceRecord | None:
@@ -422,9 +488,19 @@ def _read_voice_record(path: Path) -> VoiceRecord | None:
     except Exception:
         logger.warning("Skipping unreadable voice profile: %s", path)
         return None
+
+    try:
+        tags = json.loads(metadata["tags"]) if metadata.get("tags") else []
+    except (json.JSONDecodeError, TypeError):
+        tags = []
+
     return VoiceRecord(
         id=metadata.get("id", path.stem),
         name=metadata.get("name", path.stem),
+        gender=metadata.get("gender") or None,
+        language=metadata.get("language") or None,
+        accent=metadata.get("accent") or None,
+        tags=tags,
     )
 
 
@@ -432,10 +508,22 @@ def _read_voice_record(path: Path) -> VoiceRecord | None:
 def create_voice(
     name: str = Form(...),
     voice_wav: UploadFile = File(...),
+    gender: str | None = Form(
+        None, description=f"Optional gender tag, one of {GENDER_VALUES}."
+    ),
+    language: str | None = Form(None, description="Optional language tag."),
+    accent: str | None = Form(
+        None, description="Optional accent tag, e.g. 'scottish', 'southern_us'."
+    ),
+    tags: str | None = Form(
+        None, description="Optional comma-separated free-form grouping tags."
+    ),
 ):
     """Clone a voice from an audio sample and save it as a reusable profile."""
     if not name.strip():
         raise HTTPException(status_code=400, detail="Name cannot be empty")
+    gender = _validate_gender(gender)
+    parsed_tags = _parse_tags_field(tags)
 
     suffix = Path(voice_wav.filename).suffix if voice_wav.filename else ".wav"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
@@ -454,9 +542,13 @@ def create_voice(
 
     voice_id = uuid.uuid4().hex
     dest_path = VOICES_DIR / f"{voice_id}.safetensors"
-    export_model_state(model_state, dest_path, metadata={"id": voice_id, "name": name})
+    metadata = _voice_metadata(voice_id, name, gender, language, accent, parsed_tags)
+    export_model_state(model_state, dest_path, metadata=metadata)
 
-    return VoiceRecord(id=voice_id, name=name)
+    return VoiceRecord(
+        id=voice_id, name=name, gender=gender, language=language, accent=accent,
+        tags=parsed_tags,
+    )
 
 
 @web_app.post("/voices/blend", response_model=VoiceRecord, status_code=201)
@@ -468,6 +560,16 @@ def blend_voice(
         description="Optional comma-separated per-file weights (e.g. '0.7,0.3'), "
         "same order as voice_wavs. Defaults to equal weights.",
     ),
+    gender: str | None = Form(
+        None, description=f"Optional gender tag, one of {GENDER_VALUES}."
+    ),
+    language: str | None = Form(None, description="Optional language tag."),
+    accent: str | None = Form(
+        None, description="Optional accent tag, e.g. 'scottish', 'southern_us'."
+    ),
+    tags: str | None = Form(
+        None, description="Optional comma-separated free-form grouping tags."
+    ),
 ):
     """Blend two or more audio samples into a new voice profile, by averaging
     their conditioning latents before priming the model state. Experimental -
@@ -478,6 +580,8 @@ def blend_voice(
         raise HTTPException(
             status_code=400, detail="Blending requires at least 2 audio files"
         )
+    gender = _validate_gender(gender)
+    parsed_tags = _parse_tags_field(tags)
 
     parsed_weights = None
     if weights and weights.strip():
@@ -513,18 +617,53 @@ def blend_voice(
 
     voice_id = uuid.uuid4().hex
     dest_path = VOICES_DIR / f"{voice_id}.safetensors"
-    export_model_state(model_state, dest_path, metadata={"id": voice_id, "name": name})
+    metadata = _voice_metadata(voice_id, name, gender, language, accent, parsed_tags)
+    export_model_state(model_state, dest_path, metadata=metadata)
 
-    return VoiceRecord(id=voice_id, name=name)
+    return VoiceRecord(
+        id=voice_id, name=name, gender=gender, language=language, accent=accent,
+        tags=parsed_tags,
+    )
 
 
 @web_app.get("/voices", response_model=list[VoiceRecord])
-def list_voices():
-    """List all voice profiles available on this server."""
+def list_voices(
+    gender: str | None = Query(None, description="Filter to an exact gender match."),
+    language: str | None = Query(
+        None, description="Filter to an exact language match (case-insensitive)."
+    ),
+    accent: str | None = Query(
+        None, description="Filter to an exact accent match (case-insensitive)."
+    ),
+    tags: str | None = Query(
+        None,
+        description="Comma-separated tags; only voices carrying every listed "
+        "tag are returned (case-insensitive).",
+    ),
+):
+    """List voice profiles available on this server, optionally filtered by
+    gender/language/accent/tags."""
     records = (
         _read_voice_record(path) for path in sorted(VOICES_DIR.glob("*.safetensors"))
     )
-    return [record for record in records if record is not None]
+    records = [record for record in records if record is not None]
+
+    if gender:
+        wanted_gender = gender.strip().lower()
+        records = [r for r in records if r.gender == wanted_gender]
+    if language:
+        wanted_language = language.strip().lower()
+        records = [r for r in records if (r.language or "").lower() == wanted_language]
+    if accent:
+        wanted_accent = accent.strip().lower()
+        records = [r for r in records if (r.accent or "").lower() == wanted_accent]
+    if tags:
+        wanted_tags = {t.strip().lower() for t in tags.split(",") if t.strip()}
+        records = [
+            r for r in records if wanted_tags.issubset({t.lower() for t in r.tags})
+        ]
+
+    return records
 
 
 @web_app.get("/voices/{voice_id}", response_model=VoiceRecord)
@@ -538,6 +677,38 @@ def get_voice(voice_id: str):
     if record is None:
         raise HTTPException(status_code=404, detail="Voice not found")
     return record
+
+
+@web_app.patch("/voices/{voice_id}", response_model=VoiceRecord)
+def update_voice(voice_id: str, update: VoiceUpdate):
+    """Update a voice profile's tags/metadata in place - the underlying
+    conditioning audio is untouched. Fields left unset are left as-is."""
+    if not _VOICE_ID_PATTERN.match(voice_id):
+        raise HTTPException(status_code=404, detail="Voice not found")
+
+    path = VOICES_DIR / f"{voice_id}.safetensors"
+    record = _read_voice_record(path) if path.exists() else None
+    if record is None:
+        raise HTTPException(status_code=404, detail="Voice not found")
+
+    name = update.name if update.name is not None else record.name
+    if not name.strip():
+        raise HTTPException(status_code=400, detail="Name cannot be empty")
+    gender = (
+        _validate_gender(update.gender) if update.gender is not None else record.gender
+    )
+    language = update.language if update.language is not None else record.language
+    accent = update.accent if update.accent is not None else record.accent
+    tags = update.tags if update.tags is not None else record.tags
+
+    model_state = _import_model_state(path, tts_model.device)
+    metadata = _voice_metadata(voice_id, name, gender, language, accent, tags)
+    export_model_state(model_state, path, metadata=metadata)
+
+    return VoiceRecord(
+        id=voice_id, name=name, gender=gender, language=language, accent=accent,
+        tags=tags,
+    )
 
 
 @web_app.get("/voices/{voice_id}/data")
