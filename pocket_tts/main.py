@@ -450,7 +450,7 @@ def _validate_gender(gender: str | None) -> str | None:
 
 def _parse_tags_field(tags: str | None) -> list[str]:
     """Parse a comma-separated `tags` form field (used by the multipart
-    create/blend endpoints) into a list, deduplicated and order-preserved."""
+    create endpoint) into a list, deduplicated and order-preserved."""
     if not tags:
         return []
     seen: dict[str, None] = {}
@@ -539,81 +539,6 @@ def create_voice(
         )
     finally:
         os.unlink(temp_file_path)
-
-    voice_id = uuid.uuid4().hex
-    dest_path = VOICES_DIR / f"{voice_id}.safetensors"
-    metadata = _voice_metadata(voice_id, name, gender, language, accent, parsed_tags)
-    export_model_state(model_state, dest_path, metadata=metadata)
-
-    return VoiceRecord(
-        id=voice_id, name=name, gender=gender, language=language, accent=accent,
-        tags=parsed_tags,
-    )
-
-
-@web_app.post("/voices/blend", response_model=VoiceRecord, status_code=201)
-def blend_voice(
-    name: str = Form(...),
-    voice_wavs: list[UploadFile] = File(...),
-    weights: str | None = Form(
-        None,
-        description="Optional comma-separated per-file weights (e.g. '0.7,0.3'), "
-        "same order as voice_wavs. Defaults to equal weights.",
-    ),
-    gender: str | None = Form(
-        None, description=f"Optional gender tag, one of {GENDER_VALUES}."
-    ),
-    language: str | None = Form(None, description="Optional language tag."),
-    accent: str | None = Form(
-        None, description="Optional accent tag, e.g. 'scottish', 'southern_us'."
-    ),
-    tags: str | None = Form(
-        None, description="Optional comma-separated free-form grouping tags."
-    ),
-):
-    """Blend two or more audio samples into a new voice profile, by averaging
-    their conditioning latents before priming the model state. Experimental -
-    see TTSModel.get_state_for_blended_audio_prompts()."""
-    if not name.strip():
-        raise HTTPException(status_code=400, detail="Name cannot be empty")
-    if len(voice_wavs) < 2:
-        raise HTTPException(
-            status_code=400, detail="Blending requires at least 2 audio files"
-        )
-    gender = _validate_gender(gender)
-    parsed_tags = _parse_tags_field(tags)
-
-    parsed_weights = None
-    if weights and weights.strip():
-        try:
-            parsed_weights = [float(w) for w in weights.split(",")]
-        except ValueError:
-            raise HTTPException(
-                status_code=400,
-                detail="weights must be a comma-separated list of numbers",
-            )
-        if len(parsed_weights) != len(voice_wavs):
-            raise HTTPException(
-                status_code=400, detail="weights must have one value per audio file"
-            )
-
-    temp_paths = []
-    try:
-        for voice_wav in voice_wavs:
-            suffix = Path(voice_wav.filename).suffix if voice_wav.filename else ".wav"
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
-                temp_file.write(voice_wav.file.read())
-                temp_file.flush()
-                temp_paths.append(Path(temp_file.name))
-
-        model_state = tts_model.get_state_for_blended_audio_prompts(
-            temp_paths, weights=parsed_weights, truncate=True
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    finally:
-        for temp_path in temp_paths:
-            os.unlink(temp_path)
 
     voice_id = uuid.uuid4().hex
     dest_path = VOICES_DIR / f"{voice_id}.safetensors"
