@@ -7,18 +7,21 @@ import sys
 import tempfile
 import threading
 import uuid
+from collections.abc import Callable, Generator, Iterable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from queue import Queue
+from typing import Annotated, BinaryIO, cast
+
+import torch
 
 import typer
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from safetensors import safe_open
-from typing_extensions import Annotated
 
 from pocket_tts.data.audio import stream_audio_chunks
 from pocket_tts.default_parameters import (
@@ -26,23 +29,24 @@ from pocket_tts.default_parameters import (
     DEFAULT_DIALOGUE_SILENCE_DURATION_S,
     DEFAULT_EOS_THRESHOLD,
     DEFAULT_FRAMES_AFTER_EOS,
-    DEFAULT_LSD_DECODE_STEPS,
     DEFAULT_NOISE_CLAMP,
+    DEFAULT_SAMPLER_DECODE_STEPS,
     DEFAULT_SILENCE_DURATION_S,
     DEFAULT_VOICES_DIR,
     MAX_TOKEN_PER_CHUNK,
     get_default_text_for_language,
     get_default_voice_for_language,
 )
-from pocket_tts.models.tts_model import TTSModel, _import_model_state, export_model_state
+from pocket_tts.models.model_state import _import_model_state, export_model_state
+from pocket_tts.models.tts_model import TTSModel
+from pocket_tts.modules.stateful_module import ModelState
 from pocket_tts.utils.logging_utils import enable_logging
 from pocket_tts.utils.utils import _ORIGINS_OF_PREDEFINED_VOICES
 
 logger = logging.getLogger(__name__)
 
 cli_app = typer.Typer(
-    help="Kyutai Pocket TTS - Text-to-Speech generation tool",
-    pretty_exceptions_show_locals=False,
+    help="Kyutai Pocket TTS - Text-to-Speech generation tool", pretty_exceptions_show_locals=False
 )
 
 
@@ -54,6 +58,10 @@ cli_app = typer.Typer(
 # uvicorn spawns multiple worker processes (each a full copy of this module),
 # so each worker ends up with its own independent `tts_model` here.
 tts_model: TTSModel | None = None
+
+# State of the voice served when a request doesn't specify one. Resolved once per worker at
+# startup (see `lifespan`), so requests never pay for the encoding of the default voice.
+default_voice_state: ModelState | None = None
 
 # Directory where cloned voice profiles (.safetensors) are persisted, set by
 # the lifespan startup hook below.
@@ -78,6 +86,7 @@ _VOICE_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 # which subprocesses inherit automatically.
 _ENV_LANGUAGE = "POCKET_TTS_LANGUAGE"
 _ENV_CONFIG = "POCKET_TTS_CONFIG"
+_ENV_DEFAULT_VOICE = "POCKET_TTS_DEFAULT_VOICE"
 _ENV_QUANTIZE = "POCKET_TTS_QUANTIZE"
 _ENV_VOICES_DIR = "POCKET_TTS_VOICES_DIR"
 _ENV_MAX_TOKENS = "POCKET_TTS_MAX_TOKENS"
@@ -87,7 +96,8 @@ _ENV_QUIET = "POCKET_TTS_QUIET"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global tts_model, VOICES_DIR, DEFAULT_MAX_TOKENS_PER_CHUNK, DEFAULT_CHUNK_CONDITIONING
+    global tts_model, default_voice_state
+    global VOICES_DIR, DEFAULT_MAX_TOKENS_PER_CHUNK, DEFAULT_CHUNK_CONDITIONING
 
     quiet = os.environ.get(_ENV_QUIET) == "1"
     with enable_logging("pocket_tts", logging.ERROR if quiet else logging.INFO):
@@ -95,15 +105,17 @@ async def lifespan(app: FastAPI):
         config = os.environ.get(_ENV_CONFIG) or None
         quantize = os.environ.get(_ENV_QUANTIZE) == "1"
         voices_dir = os.environ.get(_ENV_VOICES_DIR, DEFAULT_VOICES_DIR)
-        DEFAULT_MAX_TOKENS_PER_CHUNK = int(
-            os.environ.get(_ENV_MAX_TOKENS) or MAX_TOKEN_PER_CHUNK
-        )
+        DEFAULT_MAX_TOKENS_PER_CHUNK = int(os.environ.get(_ENV_MAX_TOKENS) or MAX_TOKEN_PER_CHUNK)
         DEFAULT_CHUNK_CONDITIONING = os.environ.get(_ENV_CHUNK_CONDITIONING) or "independent"
 
         logger.info("Loading model instance (pid=%d)...", os.getpid())
-        tts_model = TTSModel.load_model(
-            language=language, config=config, quantize=quantize
+        tts_model = TTSModel.load_model(language=language, config=config, quantize=quantize)
+        default_voice = os.environ.get(_ENV_DEFAULT_VOICE) or get_default_voice_for_language(
+            language, config
         )
+        # Resolved before serving: a voice that cannot be loaded fails at startup instead of
+        # on the first request, which would otherwise pay for encoding the audio file.
+        default_voice_state = tts_model.get_state_for_audio_prompt(default_voice)
         VOICES_DIR = Path(voices_dir).expanduser()
         VOICES_DIR.mkdir(parents=True, exist_ok=True)
         logger.info("Model instance loaded (pid=%d).", os.getpid())
@@ -130,16 +142,20 @@ web_app.add_middleware(
 )
 
 
+def _loaded_model() -> TTSModel:
+    if tts_model is None:
+        raise RuntimeError("no model loaded: the lifespan hook loads it before serving requests")
+    return tts_model
+
+
 @web_app.get("/", response_class=HTMLResponse)
-async def root():
+async def root() -> str:
     """Serve the frontend."""
     static_path = Path(__file__).parent / "static" / "index.html"
-    content = static_path.read_text(encoding='utf-8')
+    content = static_path.read_text(encoding="utf-8")
     # Replace the placeholder with the actual default text prompt
-    print(str(tts_model.origin))
-    content = content.replace(
-        "DEFAULT_TEXT_PROMPT", get_default_text_for_language(str(tts_model.origin))
-    )
+    origin = str(_loaded_model().origin)
+    content = content.replace("DEFAULT_TEXT_PROMPT", get_default_text_for_language(origin))
     return content
 
 
@@ -148,49 +164,59 @@ async def health():
     return {"status": "healthy"}
 
 
-def stream_wav_chunks_via_queue(audio_chunks_factory):
+class _FileLikeToQueue(io.IOBase):
+    """Allows writing to the StreamingResponse as if it were a file."""
+
+    def __init__(self, queue: Queue[bytes | None]):
+        self.queue = queue
+
+    def write(self, data: bytes):
+        self.queue.put(data)
+
+    def flush(self):
+        pass
+
+    def close(self):
+        self.queue.put(None)
+
+
+def stream_wav_chunks_via_queue(
+    audio_chunks_factory: Callable[[threading.Event], Iterable[torch.Tensor]],
+) -> Generator[bytes, None, None]:
     """Bridge a background-threaded audio-chunk generator into a synchronous
     byte-yielding generator suitable for `StreamingResponse`.
 
-    `audio_chunks_factory` is called (with no arguments) on a background
-    thread and must return an iterable of audio chunk tensors - typically a
-    `TTSModel.generate_audio_stream(...)` or
-    `TTSModel.generate_dialogue_stream(...)` call. Shared by `/tts` and
-    `/dialogue` so both stream WAV bytes the same way.
+    `audio_chunks_factory` is called on a background thread with a `threading.Event` that is set
+    when the client goes away, and must return an iterable of audio chunk tensors - typically a
+    `TTSModel.generate_audio_stream(...)` or `TTSModel.generate_dialogue_stream(...)` call
+    forwarding that event as `stop`. Shared by `/tts` and `/dialogue` so both stream WAV bytes the
+    same way.
     """
-
-    class FileLikeToQueue(io.IOBase):
-        def __init__(self, queue):
-            self.queue = queue
-
-        def write(self, data):
-            self.queue.put(data)
-
-        def flush(self):
-            pass
-
-        def close(self):
-            self.queue.put(None)
-
-    queue = Queue()
+    queue: Queue[bytes | None] = Queue()
+    stop = threading.Event()
+    model = _loaded_model()
 
     def write_to_queue():
         stream_audio_chunks(
-            FileLikeToQueue(queue),
-            audio_chunks_factory(),
-            tts_model.config.mimi.sample_rate,
+            cast(BinaryIO, _FileLikeToQueue(queue)),
+            audio_chunks_factory(stop),
+            model.config.mimi.sample_rate,
         )
 
     thread = threading.Thread(target=write_to_queue)
     thread.start()
 
-    while True:
-        data = queue.get()
-        if data is None:
-            break
-        yield data
-
-    thread.join()
+    try:
+        while True:
+            data = queue.get()
+            if data is None:
+                break
+            yield data
+    finally:
+        # Also runs when the client disconnects: stop the generation instead of finishing it
+        # for nobody, and make sure the worker is done with the model.
+        stop.set()
+        thread.join()
 
 
 @web_app.post("/tts")
@@ -236,17 +262,11 @@ def text_to_speech(
         chunk_conditioning = DEFAULT_CHUNK_CONDITIONING
     elif chunk_conditioning not in ("independent", "teacher_forcing"):
         raise HTTPException(
-            status_code=400,
-            detail="chunk_conditioning must be 'independent' or 'teacher_forcing'",
+            status_code=400, detail="chunk_conditioning must be 'independent' or 'teacher_forcing'"
         )
-
-    if voice_url is None and voice_wav is None:
-        voice_url = get_default_voice_for_language(str(tts_model.origin))
 
     if voice_url is not None and voice_wav is not None:
-        raise HTTPException(
-            status_code=400, detail="Cannot provide both voice_url and voice_wav"
-        )
+        raise HTTPException(status_code=400, detail="Cannot provide both voice_url and voice_wav")
 
     # Use the appropriate model state
     if voice_url is not None:
@@ -257,10 +277,9 @@ def text_to_speech(
             or voice_url in _ORIGINS_OF_PREDEFINED_VOICES
         ):
             raise HTTPException(
-                status_code=400,
-                detail="voice_url must start with http://, https://, or hf://",
+                status_code=400, detail="voice_url must start with http://, https://, or hf://"
             )
-        model_state = tts_model._cached_get_state_for_audio_prompt(voice_url)
+        model_state = _loaded_model()._cached_get_state_for_audio_prompt(voice_url)
         logging.warning("Using voice from URL: %s", voice_url)
     elif voice_wav is not None:
         # Use uploaded voice file - preserve extension for format detection
@@ -273,21 +292,24 @@ def text_to_speech(
 
         # Close the file before reading it back (required on Windows)
         try:
-            model_state = tts_model.get_state_for_audio_prompt(
+            model_state = _loaded_model().get_state_for_audio_prompt(
                 Path(temp_file_path), truncate=True
             )
         finally:
             os.unlink(temp_file_path)
+    elif default_voice_state is not None:
+        model_state = default_voice_state
     else:
-        raise HTTPException(status_code=500, detail="This should never happen.")
+        raise HTTPException(status_code=500, detail="The server has no default voice loaded.")
 
     return StreamingResponse(
         stream_wav_chunks_via_queue(
-            lambda: tts_model.generate_audio_stream(
+            lambda stop: _loaded_model().generate_audio_stream(
                 model_state=model_state,
                 text_to_generate=text,
                 max_tokens=max_tokens,
                 chunk_conditioning=chunk_conditioning,
+                stop=stop,
             )
         ),
         media_type="audio/wav",
@@ -327,7 +349,7 @@ class DialogueRequest(BaseModel):
     crossfade_duration: float | None = None
 
 
-def _resolve_voice_url_or_400(voice_url: str, speaker: str) -> dict:
+def _resolve_voice_url_or_400(voice_url: str, speaker: str) -> ModelState:
     if not (
         voice_url.startswith("http://")
         or voice_url.startswith("https://")
@@ -339,7 +361,7 @@ def _resolve_voice_url_or_400(voice_url: str, speaker: str) -> dict:
             detail=f"Invalid voice_url for speaker {speaker!r}: must start with "
             "http://, https://, or hf://, or be a predefined voice name",
         )
-    return tts_model._cached_get_state_for_audio_prompt(voice_url)
+    return _loaded_model()._cached_get_state_for_audio_prompt(voice_url)
 
 
 @web_app.post("/dialogue")
@@ -355,8 +377,7 @@ def dialogue(request: DialogueRequest):
     missing_speakers = sorted({t.speaker for t in turns} - request.voices.keys())
     if missing_speakers:
         raise HTTPException(
-            status_code=400,
-            detail=f"No voice assigned for speaker(s): {missing_speakers}",
+            status_code=400, detail=f"No voice assigned for speaker(s): {missing_speakers}"
         )
 
     max_tokens = request.max_tokens or DEFAULT_MAX_TOKENS_PER_CHUNK
@@ -366,8 +387,7 @@ def dialogue(request: DialogueRequest):
     chunk_conditioning = request.chunk_conditioning or DEFAULT_CHUNK_CONDITIONING
     if chunk_conditioning not in ("independent", "teacher_forcing"):
         raise HTTPException(
-            status_code=400,
-            detail="chunk_conditioning must be 'independent' or 'teacher_forcing'",
+            status_code=400, detail="chunk_conditioning must be 'independent' or 'teacher_forcing'"
         )
 
     turn_silence_duration = (
@@ -390,12 +410,13 @@ def dialogue(request: DialogueRequest):
 
     return StreamingResponse(
         stream_wav_chunks_via_queue(
-            lambda: tts_model.generate_dialogue_stream(
+            lambda stop: _loaded_model().generate_dialogue_stream(
                 turns=resolved_turns,
                 max_tokens=max_tokens,
                 chunk_conditioning=chunk_conditioning,
                 turn_silence_duration=turn_silence_duration,
                 crossfade_duration=crossfade_duration,
+                stop=stop,
             )
         ),
         media_type="audio/wav",
@@ -442,9 +463,7 @@ def _validate_gender(gender: str | None) -> str | None:
         return None
     gender = gender.strip().lower()
     if gender not in GENDER_VALUES:
-        raise HTTPException(
-            status_code=400, detail=f"gender must be one of {GENDER_VALUES}"
-        )
+        raise HTTPException(status_code=400, detail=f"gender must be one of {GENDER_VALUES}")
     return gender
 
 
@@ -508,16 +527,12 @@ def _read_voice_record(path: Path) -> VoiceRecord | None:
 def create_voice(
     name: str = Form(...),
     voice_wav: UploadFile = File(...),
-    gender: str | None = Form(
-        None, description=f"Optional gender tag, one of {GENDER_VALUES}."
-    ),
+    gender: str | None = Form(None, description=f"Optional gender tag, one of {GENDER_VALUES}."),
     language: str | None = Form(None, description="Optional language tag."),
     accent: str | None = Form(
         None, description="Optional accent tag, e.g. 'scottish', 'southern_us'."
     ),
-    tags: str | None = Form(
-        None, description="Optional comma-separated free-form grouping tags."
-    ),
+    tags: str | None = Form(None, description="Optional comma-separated free-form grouping tags."),
 ):
     """Clone a voice from an audio sample and save it as a reusable profile."""
     if not name.strip():
@@ -534,7 +549,7 @@ def create_voice(
 
     # Close the file before reading it back (required on Windows)
     try:
-        model_state = tts_model.get_state_for_audio_prompt(
+        model_state = _loaded_model().get_state_for_audio_prompt(
             Path(temp_file_path), truncate=True
         )
     finally:
@@ -546,8 +561,7 @@ def create_voice(
     export_model_state(model_state, dest_path, metadata=metadata)
 
     return VoiceRecord(
-        id=voice_id, name=name, gender=gender, language=language, accent=accent,
-        tags=parsed_tags,
+        id=voice_id, name=name, gender=gender, language=language, accent=accent, tags=parsed_tags
     )
 
 
@@ -568,9 +582,7 @@ def list_voices(
 ):
     """List voice profiles available on this server, optionally filtered by
     gender/language/accent/tags."""
-    records = (
-        _read_voice_record(path) for path in sorted(VOICES_DIR.glob("*.safetensors"))
-    )
+    records = (_read_voice_record(path) for path in sorted(VOICES_DIR.glob("*.safetensors")))
     records = [record for record in records if record is not None]
 
     if gender:
@@ -584,9 +596,7 @@ def list_voices(
         records = [r for r in records if (r.accent or "").lower() == wanted_accent]
     if tags:
         wanted_tags = {t.strip().lower() for t in tags.split(",") if t.strip()}
-        records = [
-            r for r in records if wanted_tags.issubset({t.lower() for t in r.tags})
-        ]
+        records = [r for r in records if wanted_tags.issubset({t.lower() for t in r.tags})]
 
     return records
 
@@ -619,20 +629,17 @@ def update_voice(voice_id: str, update: VoiceUpdate):
     name = update.name if update.name is not None else record.name
     if not name.strip():
         raise HTTPException(status_code=400, detail="Name cannot be empty")
-    gender = (
-        _validate_gender(update.gender) if update.gender is not None else record.gender
-    )
+    gender = _validate_gender(update.gender) if update.gender is not None else record.gender
     language = update.language if update.language is not None else record.language
     accent = update.accent if update.accent is not None else record.accent
     tags = update.tags if update.tags is not None else record.tags
 
-    model_state = _import_model_state(path, tts_model.device)
+    model_state = _import_model_state(path, _loaded_model().device)
     metadata = _voice_metadata(voice_id, name, gender, language, accent, tags)
     export_model_state(model_state, path, metadata=metadata)
 
     return VoiceRecord(
-        id=voice_id, name=name, gender=gender, language=language, accent=accent,
-        tags=tags,
+        id=voice_id, name=name, gender=gender, language=language, accent=accent, tags=tags
     )
 
 
@@ -647,9 +654,7 @@ def get_voice_data(voice_id: str):
     if record is None:
         raise HTTPException(status_code=404, detail="Voice not found")
 
-    return FileResponse(
-        path=path, media_type="application/octet-stream", filename=path.name
-    )
+    return FileResponse(path=path, media_type="application/octet-stream", filename=path.name)
 
 
 @web_app.delete("/voices/{voice_id}")
@@ -680,8 +685,8 @@ def serve(
         str | None,
         typer.Option(
             help="Language for the TTS model. "
-            "'english_2026-01', 'english_2026-04', 'english', 'french_24l', 'german_24l', 'portuguese', 'italian', 'spanish'."
-            " Incompatible with the config argument. Default is 'english', which is the same model as 'english_2026-04'.",
+            "'english_2026-01', 'english_2026-04', 'english_2026-09', 'english_2026-09_2', 'english_drifting_26-09', 'english', 'french', 'french_24l', 'german', 'german_24l', 'portuguese', 'portuguese_24l', 'italian', 'italian_24l', 'spanish', 'spanish_24l', 'dutch', 'dutch_24l'."
+            " Incompatible with the config argument. Default is 'english', which is the same model as 'english_2026-09_2'.",
             show_default=False,
         ),
     ] = None,
@@ -695,9 +700,17 @@ def serve(
     quantize: Annotated[
         bool, typer.Option(help="Apply int8 quantization to reduce memory usage")
     ] = False,
+    default_voice: Annotated[
+        str | None,
+        typer.Option(
+            help="Voice used by requests that don't ask for one: a built-in voice name, "
+            "a local path to an audio file or to a .safetensors voice, an https:// URL, "
+            "or an hf:// path. Defaults to the built-in voice of the language.",
+            show_default=False,
+        ),
+    ] = None,
     voices_dir: Annotated[
-        str,
-        typer.Option(help="Directory to store voice profiles created via POST /voices"),
+        str, typer.Option(help="Directory to store voice profiles created via POST /voices")
     ] = DEFAULT_VOICES_DIR,
     max_tokens: Annotated[
         int,
@@ -733,22 +746,16 @@ def serve(
             "concurrently. Default is 1 (a single process, no concurrency)."
         ),
     ] = 1,
-    quiet: Annotated[
-        bool, typer.Option("-q", "--quiet", help="Disable logging output")
-    ] = False,
+    quiet: Annotated[bool, typer.Option("-q", "--quiet", help="Disable logging output")] = False,
 ):
     """Start the FastAPI server."""
 
     if reload and batch_size > 1:
-        raise typer.BadParameter(
-            "--reload and --batch-size > 1 cannot be used together."
-        )
+        raise typer.BadParameter("--reload and --batch-size > 1 cannot be used together.")
 
     chunk_conditioning = chunk_conditioning.replace("-", "_")
     if chunk_conditioning not in ("independent", "teacher_forcing"):
-        raise typer.BadParameter(
-            "--chunk-conditioning must be 'independent' or 'teacher-forcing'."
-        )
+        raise typer.BadParameter("--chunk-conditioning must be 'independent' or 'teacher-forcing'.")
 
     # The model itself can't be loaded here and shared with worker processes:
     # each worker (when batch_size > 1) is a separate process that imports
@@ -757,6 +764,7 @@ def serve(
     # worker subprocesses inherit.
     os.environ[_ENV_LANGUAGE] = language or ""
     os.environ[_ENV_CONFIG] = config or ""
+    os.environ[_ENV_DEFAULT_VOICE] = default_voice or ""
     os.environ[_ENV_QUANTIZE] = "1" if quantize else "0"
     os.environ[_ENV_VOICES_DIR] = voices_dir
     os.environ[_ENV_MAX_TOKENS] = str(max_tokens)
@@ -779,7 +787,7 @@ def serve(
 
 @cli_app.command()
 def generate(
-    text: Annotated[str, typer.Option(help="Text to generate")] = None,
+    text: Annotated[str | None, typer.Option(help="Text to generate")] = None,
     voice: Annotated[
         str | None,
         typer.Option(
@@ -787,22 +795,21 @@ def generate(
                 "Path to audio conditioning file (voice to clone). "
                 "Defaults to a built-in voice chosen from the language: "
                 "'giovanni' for italian, 'lola' for spanish, 'juergen' for german, "
-                "'rafael' for portuguese, 'estelle' for french, 'alba' otherwise."
+                "'rafael' for portuguese, 'estelle' for french, 'alba' otherwise. "
+                "With the config or checkpoint argument, defaults to alba's audio file, "
+                "which any model can clone."
             ),
             show_default=False,
         ),
     ] = None,
-    quiet: Annotated[
-        bool, typer.Option("-q", "--quiet", help="Disable logging output")
-    ] = False,
+    quiet: Annotated[bool, typer.Option("-q", "--quiet", help="Disable logging output")] = False,
     language: Annotated[
         str | None,
         typer.Option(
             help=(
                 "Language for the TTS model. "
-                "'english_2026-01', 'english_2026-04', 'english', 'french_24l', 'spanish_24l',"
-                "'german_24l', 'portuguese_24l', 'italian_24l'."
-                " Incompatible with the config argument. Default is 'english', which is the same model as 'english_2026-04'. "
+                "'english_2026-01', 'english_2026-04', 'english_2026-09', 'english_2026-09_2', 'english_drifting_26-09', 'english', 'french', 'french_24l', 'german', 'german_24l', 'portuguese', 'portuguese_24l', 'italian', 'italian_24l', 'spanish', 'spanish_24l', 'dutch', 'dutch_24l'."
+                " Incompatible with the config argument. Default is 'english', which is the same model as 'english_2026-09_2'. "
                 "The '24l' variants are bigger models, "
                 "not distilled yet and here only as preview. They're not the final "
                 "models for those languages."
@@ -813,28 +820,33 @@ def generate(
     config: Annotated[
         str | None,
         typer.Option(
-            help="Path to locally-saved model config .yaml file. "
+            help="Path to a model config .yaml file: a local path, an https:// URL, or an hf:// path. "
             "Incompatible with the language argument. If not provided, will use the default English model."
         ),
     ] = None,
-    lsd_decode_steps: Annotated[
+    checkpoint: Annotated[
+        str | None,
+        typer.Option(help="Training checkpoint (.pt) to load instead of the config's weights"),
+    ] = None,
+    sampler_decode_steps: Annotated[
         int, typer.Option(help="Number of generation steps")
-    ] = DEFAULT_LSD_DECODE_STEPS,
+    ] = DEFAULT_SAMPLER_DECODE_STEPS,
+    lsd_decode_steps: Annotated[
+        int | None, typer.Option(hidden=True, help="Deprecated: use --sampler-decode-steps")
+    ] = None,
     temperature: Annotated[
         float | None,
         typer.Option(
             help="Temperature for generation. Defaults to the model's recommended "
-            "value from its config (0.3 for the English model, 0.7 otherwise)."
+            "value from its config (0.3)."
         ),
     ] = None,
     noise_clamp: Annotated[
-        float, typer.Option(help="Noise clamp value")
+        float | None, typer.Option(help="Noise clamp value")
     ] = DEFAULT_NOISE_CLAMP,
-    eos_threshold: Annotated[
-        float, typer.Option(help="EOS threshold")
-    ] = DEFAULT_EOS_THRESHOLD,
+    eos_threshold: Annotated[float, typer.Option(help="EOS threshold")] = DEFAULT_EOS_THRESHOLD,
     frames_after_eos: Annotated[
-        int, typer.Option(help="Number of frames to generate after EOS")
+        int | None, typer.Option(help="Number of frames to generate after EOS")
     ] = DEFAULT_FRAMES_AFTER_EOS,
     output_path: Annotated[
         str, typer.Option(help="Output path for generated audio")
@@ -880,9 +892,10 @@ def generate(
     """Generate speech using Kyutai Pocket TTS."""
     chunk_conditioning = chunk_conditioning.replace("-", "_")
     if chunk_conditioning not in ("independent", "teacher_forcing"):
-        raise typer.BadParameter(
-            "--chunk-conditioning must be 'independent' or 'teacher-forcing'."
-        )
+        raise typer.BadParameter("--chunk-conditioning must be 'independent' or 'teacher-forcing'.")
+    if lsd_decode_steps is not None:
+        logger.warning("--lsd-decode-steps is deprecated, use --sampler-decode-steps")
+        sampler_decode_steps = lsd_decode_steps
     log_level = logging.ERROR if quiet else logging.INFO
     with enable_logging("pocket_tts", log_level):
         if text is None:
@@ -898,15 +911,16 @@ def generate(
             language=language,
             config=config,
             temp=temperature,
-            lsd_decode_steps=lsd_decode_steps,
+            sampler_decode_steps=sampler_decode_steps,
             noise_clamp=noise_clamp,
             eos_threshold=eos_threshold,
             quantize=quantize,
+            checkpoint=checkpoint,
         )
         tts_model.to(device)
 
         if voice is None:
-            voice = get_default_voice_for_language(language)
+            voice = get_default_voice_for_language(language, config, checkpoint)
         model_state_for_voice = tts_model.get_state_for_audio_prompt(voice)
         # Stream audio generation directly to file or stdout
         audio_chunks = tts_model.generate_audio_stream(
@@ -919,9 +933,7 @@ def generate(
             silence_duration=silence_duration,
         )
 
-        stream_audio_chunks(
-            output_path, audio_chunks, tts_model.config.mimi.sample_rate
-        )
+        stream_audio_chunks(output_path, audio_chunks, tts_model.config.mimi.sample_rate)
 
         # Only print the result message if not writing to stdout
         if output_path != "-":
@@ -946,17 +958,14 @@ def export_voice(
         str, typer.Argument(help="Audio file or directory to convert and export")
     ],
     export_path: Annotated[str, typer.Argument(help="Output file or directory")],
-    quiet: Annotated[
-        bool, typer.Option("-q", "--quiet", help="Disable logging output")
-    ] = False,
+    quiet: Annotated[bool, typer.Option("-q", "--quiet", help="Disable logging output")] = False,
     language: Annotated[
         str | None,
         typer.Option(
             help=(
                 "Language for the TTS model. "
-                "'english_2026-01', 'english_2026-04', 'english', 'french_24l', 'german_24l','spanish_24l',"
-                " 'portuguese_24l', 'italian_24l'."
-                " Incompatible with the config argument. Default is 'english', which is the same model as 'english_2026-04'. "
+                "'english_2026-01', 'english_2026-04', 'english_2026-09', 'english_2026-09_2', 'english_drifting_26-09', 'english', 'french', 'french_24l', 'german', 'german_24l', 'portuguese', 'portuguese_24l', 'italian', 'italian_24l', 'spanish', 'spanish_24l', 'dutch', 'dutch_24l'."
+                " Incompatible with the config argument. Default is 'english', which is the same model as 'english_2026-09_2'. "
                 "The '24l' variants are bigger models, "
                 "not distilled yet and here only as preview."
             ),
@@ -966,7 +975,7 @@ def export_voice(
     config: Annotated[
         str | None,
         typer.Option(
-            help="Path to locally-saved model config .yaml file. "
+            help="Path to a model config .yaml file: a local path, an https:// URL, or an hf:// path. "
             "Incompatible with the language argument. If not provided, will use the default English model."
         ),
     ] = None,

@@ -5,6 +5,8 @@ from pathlib import Path
 import yaml
 from pydantic import BaseModel, ConfigDict
 
+from pocket_tts.utils.utils import download_if_necessary
+
 CONFIGS_DIR = Path(__file__).parent.parent / "config"
 
 
@@ -16,6 +18,10 @@ class StrictModel(BaseModel):
 class FlowConfig(StrictModel):
     dim: int
     depth: int
+    # "lsd" (2 time conditions, 1-step decode), "flow_matching" (1 time
+    # condition, Euler integration; needs >= 16 decode steps) or "drifting"
+    # (no time condition, the head maps noise to a sample in one step).
+    type: str = "lsd"
 
 
 # Transformer configuration for FlowLM
@@ -115,12 +121,26 @@ class Config(StrictModel):
     weights_path_without_voice_cloning: str | None = None
     pad_with_spaces_for_short_inputs: bool = False
     remove_semicolons: bool = False
+    append_terminal_punctuation: bool = True
+    # Upper-casing the first letter is an orthographic convention of the
+    # Latin-script languages this model shipped with. A model whose text is
+    # romanised phonemes must switch it off: the capital is not in the phoneme
+    # inventory, so the first word's onset becomes the unknown token, and where
+    # a capital *is* a phoneme it silently changes the sound ("salAm" -> "SalAm"
+    # is /salaam/ -> /shalaam/).
+    capitalize_first_letter: bool = True
+    # Per-character rewrites applied before tokenization ("" deletes). For characters the model's
+    # training text never contained (straight quotes, curly apostrophes in CML-TTS/MLS): their
+    # embeddings are untrained and the model speaks filler syllables where they occur.
+    replace_characters: dict[str, str] = {}
     model_recommended_frames_after_eos: int | None = None
-    default_temperature: float = 0.7
+    # 0.3 beats 0.7 on WER and UTMOS for every shipped model (human evals agreed for English, #223);
+    # a config sets its own value only if it was tuned elsewhere.
+    default_temperature: float = 0.3
 
 
 def load_config(yaml_path: str | Path) -> Config:
-    yaml_path = Path(yaml_path)
+    yaml_path = download_if_necessary(str(yaml_path))
 
     if not yaml_path.exists():
         if yaml_path.is_relative_to(CONFIGS_DIR):

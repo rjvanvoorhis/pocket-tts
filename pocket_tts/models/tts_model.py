@@ -6,9 +6,10 @@ import queue
 import statistics
 import threading
 import time
+from collections.abc import Iterator
 from functools import lru_cache
 from pathlib import Path
-from urllib.parse import urlsplit
+from typing import Any
 
 import safetensors
 import safetensors.torch
@@ -18,25 +19,31 @@ from torch import nn
 from torch.nn import functional as F
 from typing_extensions import Self
 
-from pocket_tts.conditioners.base import TokenizedText
 from pocket_tts.data.audio import audio_read
-from pocket_tts.data.audio_utils import convert_audio
+from pocket_tts.data.audio_utils import convert_audio, end_on_pause
 from pocket_tts.default_parameters import (
     DEFAULT_CROSSFADE_DURATION_S,
     DEFAULT_DIALOGUE_SILENCE_DURATION_S,
     DEFAULT_EOS_THRESHOLD,
     DEFAULT_LANGUAGE,
-    DEFAULT_LSD_DECODE_STEPS,
     DEFAULT_NOISE_CLAMP,
+    DEFAULT_SAMPLER_DECODE_STEPS,
     DEFAULT_SILENCE_DURATION_S,
     MAX_TOKEN_PER_CHUNK,
 )
+from pocket_tts.models.audio_stitching import (
+    _MAX_SILENCE_TRIM_S,
+    _SILENCE_MULTIPLIER_BY_BOUNDARY_KIND,
+    _classify_chunk_boundary,
+    _crossfade_concatenated_streams,
+    _tap,
+)
 from pocket_tts.models.flow_lm import FlowLMModel
-from pocket_tts.models.mimi import MimiModel
-from pocket_tts.modules import transformer
-from pocket_tts.modules.dummy_quantizer import DummyQuantizer
-from pocket_tts.modules.seanet import SEANetDecoder, SEANetEncoder
+from pocket_tts.models.mimi import build_mimi
+from pocket_tts.models.model_state import _import_model_state, _is_safetensors_source
+from pocket_tts.models.text_chunking import prepare_text_prompt, split_into_best_sentences
 from pocket_tts.modules.stateful_module import (
+    ModelState,
     StatefulModule,
     increment_steps,
     init_states,
@@ -51,10 +58,28 @@ from pocket_tts.utils.utils import (
     get_predefined_voice,
     size_of_dict,
 )
-from pocket_tts.utils.weights_loading import get_flow_lm_state_dict, get_mimi_state_dict
+from pocket_tts.utils.weights_loading import (
+    get_flow_lm_state_dict,
+    get_mimi_state_dict,
+    get_training_checkpoint_state_dicts,
+)
 
 torch.set_num_threads(1)
 logger = logging.getLogger(__name__)
+
+# Generated latents handed to the Mimi decoder thread; None closes the stream.
+LatentQueue = queue.Queue[torch.Tensor | None]
+# Decoder thread -> generator: ("chunk", audio), ("done", None) or ("error", exception).
+ResultQueue = queue.Queue[tuple[str, Any]]
+
+
+def stamp_state_names(tts_model: "TTSModel"):
+    """StatefulModules find their slice of the state dict by absolute name."""
+    for top_module in (tts_model.flow_lm, tts_model.mimi):
+        for module_name, module in top_module.named_modules():
+            if isinstance(module, StatefulModule):
+                module._module_absolute_name = module_name
+
 
 VOICE_CLONING_UNSUPPORTED = (
     f"We could not download the weights for the model with voice cloning, "
@@ -69,24 +94,32 @@ VOICE_CLONING_UNSUPPORTED = (
 class TTSModel(nn.Module):
     _TOKENS_PER_SECOND_ESTIMATE = 3.0
     _GEN_SECONDS_PADDING = 2.0
+    # EOS is ignored on the first frames: before speech starts, the EOS logit of some voices can
+    # cross the threshold, and a short text then ends before the word is spoken.
+    _MIN_FRAMES_BEFORE_EOS = 6
 
     def __init__(
         self,
         flow_lm: FlowLMModel,
         temp: float,
-        lsd_decode_steps: int,
+        sampler_decode_steps: int,
         noise_clamp: float | None,
-        eos_threshold,
+        eos_threshold: float,
         config: Config,
         origin: Path | None = None,
         pad_with_spaces_for_short_inputs: bool = False,
         model_recommended_frames_after_eos: int | None = None,
         remove_semicolons: bool = False,
+        append_terminal_punctuation: bool = True,
+        capitalize_first_letter: bool = True,
+        replace_characters: dict[str, str] | None = None,
     ):
         super().__init__()
         self.flow_lm = flow_lm
+        # 0 = decode every queued frame in one call; 1 = one frame per call
+        self.max_decoder_frames_per_call = 0
         self.temp = temp
-        self.lsd_decode_steps = lsd_decode_steps
+        self.sampler_decode_steps = sampler_decode_steps
         self.noise_clamp = noise_clamp
         self.eos_threshold = eos_threshold
         self.config = config
@@ -95,6 +128,9 @@ class TTSModel(nn.Module):
         self.pad_with_spaces_for_short_inputs: bool = pad_with_spaces_for_short_inputs
         self.model_recommended_frames_after_eos = model_recommended_frames_after_eos
         self.remove_semicolons = remove_semicolons
+        self.append_terminal_punctuation = append_terminal_punctuation
+        self.capitalize_first_letter = capitalize_first_letter
+        self.replace_characters = replace_characters or {}
 
     @property
     def device(self) -> torch.device:
@@ -108,10 +144,10 @@ class TTSModel(nn.Module):
     def _from_pydantic_config(
         cls,
         config: Config,
-        temp,
-        lsd_decode_steps,
+        temp: float,
+        sampler_decode_steps: int,
         noise_clamp: float | None,
-        eos_threshold,
+        eos_threshold: float,
         origin: Path | None,
     ) -> Self:
         flow_lm = FlowLMModel.from_pydantic_config(
@@ -122,7 +158,7 @@ class TTSModel(nn.Module):
         tts_model = cls(
             flow_lm,
             temp,
-            lsd_decode_steps,
+            sampler_decode_steps,
             noise_clamp,
             eos_threshold,
             config,
@@ -130,21 +166,68 @@ class TTSModel(nn.Module):
             pad_with_spaces_for_short_inputs=config.pad_with_spaces_for_short_inputs,
             model_recommended_frames_after_eos=config.model_recommended_frames_after_eos,
             remove_semicolons=config.remove_semicolons,
+            append_terminal_punctuation=config.append_terminal_punctuation,
+            capitalize_first_letter=config.capitalize_first_letter,
+            replace_characters=config.replace_characters,
         )
         return tts_model
+
+    has_custom_weights: bool = False
+
+    def load_training_checkpoint(self, path: str | Path, use_ema: bool = True):
+        """Load weights from a training checkpoint (.pt) into a config-built model."""
+        self.has_custom_weights = True
+        flow_lm_state, mimi_state = get_training_checkpoint_state_dicts(Path(path), use_ema)
+        config = self.config
+        self.flow_lm.speaker_proj_weight = torch.nn.Parameter(
+            torch.zeros(
+                (
+                    config.flow_lm.transformer.d_model,
+                    config.mimi.inner_dim or config.mimi.seanet.dimension,
+                ),
+                dtype=torch.float32,
+            )
+        )
+        self.flow_lm.load_state_dict(flow_lm_state, strict=True)
+        self.mimi = build_mimi(config.mimi).to(device="cpu")
+        # Training freezes Mimi and does not checkpoint it, so its weights come
+        # from the config -- either its own safetensors or the packaged bundle.
+        if mimi_state:
+            self.mimi.load_state_dict(mimi_state, strict=False)
+        elif config.mimi.weights_path is not None:
+            self.mimi.load_state_dict(
+                get_mimi_state_dict(download_if_necessary(config.mimi.weights_path)), strict=True
+            )
+        else:
+            if config.weights_path is None:
+                raise ValueError("no Mimi weights: set mimi.weights_path or weights_path")
+            try:
+                bundle = download_if_necessary(config.weights_path)
+            except Exception:
+                if config.weights_path_without_voice_cloning is None:
+                    raise
+                self.has_voice_cloning = False
+                bundle = download_if_necessary(config.weights_path_without_voice_cloning)
+            bundled = safetensors.torch.load_file(bundle)
+            self.mimi.load_state_dict(
+                {k.removeprefix("mimi."): v for k, v in bundled.items() if k.startswith("mimi.")},
+                strict=True,
+            )
+        self.mimi.eval()
+        stamp_state_names(self)
 
     @classmethod
     def _from_pydantic_config_with_weights(
         cls,
         config: Config,
-        temp,
-        lsd_decode_steps,
+        temp: float,
+        sampler_decode_steps: int,
         noise_clamp: float | None,
-        eos_threshold,
+        eos_threshold: float,
         origin: Path | None = None,
     ) -> Self:
         tts_model = cls._from_pydantic_config(
-            config, temp, lsd_decode_steps, noise_clamp, eos_threshold, origin=origin
+            config, temp, sampler_decode_steps, noise_clamp, eos_threshold, origin=origin
         )
         tts_model.flow_lm.speaker_proj_weight = torch.nn.Parameter(
             torch.zeros(
@@ -166,35 +249,7 @@ class TTSModel(nn.Module):
             )
             tts_model.flow_lm.load_state_dict(state_dict_flowlm, strict=True)
 
-        # safetensors.torch.save_file(tts_model.state_dict(), "7442637a.safetensors")
-        # Create mimi config directly from the provided config using model_dump
-        mimi_config = config.mimi.model_dump()
-
-        # Build mimi model from config
-        encoder = SEANetEncoder(**mimi_config["seanet"])
-        decoder = SEANetDecoder(**mimi_config["seanet"])
-
-        encoder_transformer = transformer.ProjectedTransformer(
-            **mimi_config["transformer"]
-        )
-        decoder_transformer = transformer.ProjectedTransformer(
-            **mimi_config["transformer"]
-        )
-        quantizer = DummyQuantizer(**mimi_config["quantizer"])
-
-        tts_model.mimi = MimiModel(
-            encoder,
-            decoder,
-            quantizer,
-            channels=mimi_config["channels"],
-            sample_rate=mimi_config["sample_rate"],
-            frame_rate=mimi_config["frame_rate"],
-            encoder_frame_rate=mimi_config["sample_rate"] / encoder.hop_length,
-            inner_dim=mimi_config["inner_dim"],
-            outer_dim=mimi_config["outer_dim"],
-            encoder_transformer=encoder_transformer,
-            decoder_transformer=decoder_transformer,
-        ).to(device="cpu")
+        tts_model.mimi = build_mimi(config.mimi).to(device="cpu")
 
         # Load mimi weights from the config safetensors file with complete mapping for strict loading
 
@@ -204,9 +259,7 @@ class TTSModel(nn.Module):
                     "If you specify mimi.weights_path you should specify flow_lm.weights_path"
                 )
             logger.info(f"Loading Mimi weights from {config.mimi.weights_path}")
-            mimi_state = get_mimi_state_dict(
-                download_if_necessary(config.mimi.weights_path)
-            )
+            mimi_state = get_mimi_state_dict(download_if_necessary(config.mimi.weights_path))
             tts_model.mimi.load_state_dict(mimi_state, strict=True)
 
         tts_model.mimi.eval()
@@ -216,10 +269,10 @@ class TTSModel(nn.Module):
             try:
                 weights_file = download_if_necessary(config.weights_path)
             except Exception:
+                if config.weights_path_without_voice_cloning is None:
+                    raise
                 tts_model.has_voice_cloning = False
-                weights_file = download_if_necessary(
-                    config.weights_path_without_voice_cloning
-                )
+                weights_file = download_if_necessary(config.weights_path_without_voice_cloning)
 
             state_dict = safetensors.torch.load_file(weights_file)
             tts_model.load_state_dict(state_dict, strict=True)
@@ -235,13 +288,7 @@ class TTSModel(nn.Module):
             logger.info(f"Saved TTSModel weights to {save_path}")
         logging.info(f"TTS Model loaded successfully. Its size is {size_in_mb} MB")
 
-        # TODO: move this in the __init__ and make self.mimi in __init__
-        for top_module in (tts_model.flow_lm, tts_model.mimi):
-            for module_name, module in top_module.named_modules():
-                if not isinstance(module, StatefulModule):
-                    continue
-                module._module_absolute_name = module_name
-
+        stamp_state_names(tts_model)
         return tts_model
 
     @classmethod
@@ -249,11 +296,13 @@ class TTSModel(nn.Module):
         cls,
         language: str | None = None,
         config: str | Path | None = None,
-        temp: float | int | None = None,
-        lsd_decode_steps: int = DEFAULT_LSD_DECODE_STEPS,
-        noise_clamp: float | int | None = DEFAULT_NOISE_CLAMP,
+        temp: float | None = None,
+        sampler_decode_steps: int = DEFAULT_SAMPLER_DECODE_STEPS,
+        noise_clamp: float | None = DEFAULT_NOISE_CLAMP,
         eos_threshold: float = DEFAULT_EOS_THRESHOLD,
         quantize: bool = False,
+        checkpoint: str | Path | None = None,
+        lsd_decode_steps: int | None = None,
     ) -> Self:
         """Load a pre-trained TTS model with specified configuration.
 
@@ -264,19 +313,24 @@ class TTSModel(nn.Module):
         Args:
             language: Optional language identifier to select a predefined config. Incompatible with
                 the `config` argument. Available options
-                are `"english_2026-01"`, `"english_2026-04"`, `"english"`, `"french_24l"`, `"german_24l"`, `"portuguese"`, `"italian"`, `"spanish_24l"`.
-                If neither `config` nor `language` is provided, defaults to `"english", which is the same model as 'english_2026-04'`.
-            config: A path to a custom YAML config file saved locally (e.g., `"C://pocket_tts/pocket_tts_config.yaml"`).
+                are `"english_2026-01"`, `"english_2026-04"`, `"english_2026-09"`, `"english_2026-09_2"`, `"english_drifting_26-09"`, `"english"`, `"french"`, `"french_24l"`, `"german"`, `"german_24l"`, `"portuguese"`, `"portuguese_24l"`, `"italian"`, `"italian_24l"`, `"spanish"`, `"spanish_24l"`, `"dutch"`, `"dutch_24l"`.
+                If neither `config` nor `language` is provided, defaults to `"english", which is the same model as 'english_2026-09_2'`.
+            config: A path to a custom YAML config file: a local path (e.g., `"C://pocket_tts/pocket_tts_config.yaml"`),
+                an `https://` URL, or an `hf://` path (e.g. `"hf://<repo_id>/<path>[@revision]"`).
             temp: Sampling temperature for generation. Higher values produce more
                 diverse but potentially lower quality output. If None, defaults to
                 the model's recommended value from its config file
-                (``default_temperature``, e.g. 0.3 for the English model).
-            lsd_decode_steps: Number of steps for Lagrangian Self Distillation
+                (``default_temperature``, 0.3).
+            sampler_decode_steps: Number of steps for Lagrangian Self Distillation
                 decoding. More steps can improve quality but increase computation.
             noise_clamp: Maximum value for noise sampling. If None, no clamping
                 is applied. Helps prevent extreme values in generation.
             eos_threshold: Threshold for end-of-sequence detection. Higher values
                 make the model more likely to continue generating.
+            checkpoint: Optional training checkpoint (.pt) to load instead of the
+                config's safetensors weights, so any step of a run can be played
+                without exporting first. EMA weights are used when the checkpoint
+                carries them.
             quantize: If True, apply dynamic int8 quantization to the transformer's
                 attention and FFN layers. Reduces runtime memory by ~48% and improves
                 inference speed by ~27% on x86 (FBGEMM).
@@ -310,28 +364,33 @@ class TTSModel(nn.Module):
         if config is None and language is None:
             language = DEFAULT_LANGUAGE
         if language is not None:
-            if language == "french":
-                raise ValueError(
-                    "For technical reasons, only a larger 24-layer model is available for French. Please use the 'french_24l' language instead."
-                )
             config = CONFIGS_DIR / f"{language}.yaml"
-        config = Path(config)
-        if config.suffix not in (".yaml", ".yml"):
+        if lsd_decode_steps is not None:
+            logger.warning("lsd_decode_steps is deprecated, use sampler_decode_steps")
+            sampler_decode_steps = lsd_decode_steps
+
+        config_path = str(config)
+        # hf:// paths may carry a "@revision" suffix, strip it before checking the extension.
+        suffix_source = (
+            config_path.split("@")[0] if config_path.startswith("hf://") else config_path
+        )
+        if Path(suffix_source).suffix not in (".yaml", ".yml"):
             raise ValueError("Config should be a path to a YAML file ending with .yaml")
-        config_path = Path(config)
-        config = load_config(config_path)
+        model_config = load_config(config_path)
         if temp is None:
-            temp = config.default_temperature
+            temp = model_config.default_temperature
         logger.info(f"Loading model from config at {config_path}...")
 
-        tts_model = TTSModel._from_pydantic_config_with_weights(
-            config,
-            temp,
-            lsd_decode_steps,
-            noise_clamp,
-            eos_threshold,
-            origin=config_path,
-        )
+        origin = Path(config_path)
+        if checkpoint is not None:
+            tts_model = cls._from_pydantic_config(
+                model_config, temp, sampler_decode_steps, noise_clamp, eos_threshold, origin=origin
+            )
+            tts_model.load_training_checkpoint(checkpoint)
+        else:
+            tts_model = cls._from_pydantic_config_with_weights(
+                model_config, temp, sampler_decode_steps, noise_clamp, eos_threshold, origin=origin
+            )
 
         if quantize:
             apply_dynamic_int8(tts_model.flow_lm, RECOMMENDED_CONFIG)
@@ -340,27 +399,21 @@ class TTSModel(nn.Module):
 
     def _run_flow_lm_and_increment_step(
         self,
-        model_state: dict,
+        model_state: ModelState,
         text_tokens: torch.Tensor | None = None,
         backbone_input_latents: torch.Tensor | None = None,
         audio_conditioning: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """First one is the backbone output, second one is the audio decoding output."""
         if text_tokens is None:
-            text_tokens = torch.zeros(
-                (1, 0), dtype=torch.int64, device=self.flow_lm.device
-            )
+            text_tokens = torch.zeros((1, 0), dtype=torch.int64, device=self.flow_lm.device)
         if backbone_input_latents is None:
             backbone_input_latents = torch.empty(
-                (1, 0, self.flow_lm.ldim),
-                dtype=self.flow_lm.dtype,
-                device=self.flow_lm.device,
+                (1, 0, self.flow_lm.ldim), dtype=self.flow_lm.dtype, device=self.flow_lm.device
             )
         if audio_conditioning is None:
             audio_conditioning = torch.empty(
-                (1, 0, self.flow_lm.dim),
-                dtype=self.flow_lm.dtype,
-                device=self.flow_lm.device,
+                (1, 0, self.flow_lm.dim), dtype=self.flow_lm.dtype, device=self.flow_lm.device
             )
 
         output = self._run_flow_lm(
@@ -370,28 +423,26 @@ class TTSModel(nn.Module):
             audio_conditioning=audio_conditioning,
         )
         increment_by = (
-            text_tokens.shape[1]
-            + backbone_input_latents.shape[1]
-            + audio_conditioning.shape[1]
+            text_tokens.shape[1] + backbone_input_latents.shape[1] + audio_conditioning.shape[1]
         )
         increment_steps(self.flow_lm, model_state, increment=increment_by)
         return output
 
     def _run_flow_lm(
         self,
-        model_state: dict,
+        model_state: ModelState,
         text_tokens: torch.Tensor,
         backbone_input_latents: torch.Tensor,
         audio_conditioning: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        text_embeddings = self.flow_lm.conditioner(TokenizedText(text_tokens))
+        text_embeddings = self.flow_lm.conditioner(text_tokens)
         text_embeddings = torch.cat([text_embeddings, audio_conditioning], dim=1)
 
         output_embeddings, is_eos = self.flow_lm._sample_next_latent(
             backbone_input_latents,
             text_embeddings,
             model_state=model_state,
-            lsd_decode_steps=self.lsd_decode_steps,
+            sampler_decode_steps=self.sampler_decode_steps,
             temp=self.temp,
             noise_clamp=self.noise_clamp,
             eos_threshold=self.eos_threshold,
@@ -402,9 +453,7 @@ class TTSModel(nn.Module):
         mimi_state = init_states(self.mimi, batch_size=1, sequence_length=10000)
         resored_audio = self.mimi.decode_from_latent(encoded, mimi_state)
         scipy.io.wavfile.write(filename, self.sample_rate, resored_audio.numpy())
-        logger.info(
-            "Saved restored audio from Mimi encoding to %s for debugging", filename
-        )
+        logger.info("Saved restored audio from Mimi encoding to %s for debugging", filename)
 
     def _encode_audio(self, audio: torch.Tensor) -> torch.Tensor:
         encoded = self.mimi.encode_to_latent(audio)
@@ -417,30 +466,24 @@ class TTSModel(nn.Module):
         conditioning = F.linear(latents, self.flow_lm.speaker_proj_weight)
         return conditioning
 
-    def _latent_from_audio(self, audio_conditioning: torch.Tensor) -> torch.Tensor:
-        """Encode raw audio into the flow_lm's own latent space - the same
-        space `backbone_input_latents`/`next_latent` live in during
-        autoregressive generation (not the `_encode_audio` conditioning
-        space, which is a separate projection). This is the inverse of the
-        `latent * emb_std + emb_mean` step in `_decode_audio_worker`, and is
-        used to build teacher-forcing targets from a chunk's own generated
-        audio.
+    def _latent_from_audio(self, audio: torch.Tensor) -> torch.Tensor:
+        """Encode raw audio into the flow LM's own latent space.
+
+        This is the space `backbone_input_latents`/`next_latent` live in during autoregressive
+        generation (not the `_encode_audio` conditioning space, which is a separate projection),
+        i.e. the inverse of the `latent * emb_std + emb_mean` step in `_decode_audio_worker`.
+        Used to build teacher-forcing targets from a chunk's own generated audio.
 
         Args:
-            audio_conditioning: Audio already at the model's sample rate,
-                shape [channels, samples].
+            audio: Audio at the model's sample rate, shape [channels, samples].
 
         Returns:
-            torch.Tensor: Latents of shape [1, T, ldim].
+            Latents of shape [1, T, ldim].
         """
-        mimi_latent = self.mimi.encode_to_latent(
-            audio_conditioning.unsqueeze(0).to(self.device)
-        )
-        return (
-            mimi_latent.to(self.flow_lm.dtype) - self.flow_lm.emb_mean
-        ) / self.flow_lm.emb_std
+        mimi_latent = self.mimi.encode_to_latent(audio.unsqueeze(0).to(self.device))
+        return (mimi_latent.to(self.flow_lm.dtype) - self.flow_lm.emb_mean) / self.flow_lm.emb_std
 
-    def _expand_kv_cache(self, model_state: dict, sequence_length: int) -> None:
+    def _expand_kv_cache(self, model_state: ModelState, sequence_length: int):
         """Expand KV cache back to full sequence_length for generation.
 
         When a model state is retrieved from cache with sliced KV caches,
@@ -473,7 +516,7 @@ class TTSModel(nn.Module):
                     expanded_cache[:, :, :current_length, :, :] = cache
                     module_state["cache"] = expanded_cache
 
-    def _flow_lm_current_end(self, model_state: dict) -> int:
+    def _flow_lm_current_end(self, model_state: ModelState) -> int:
         for module_state in model_state.values():
             offset = module_state.get("offset")
             if offset is not None:
@@ -486,44 +529,67 @@ class TTSModel(nn.Module):
     @torch.no_grad
     def _decode_audio_worker(
         self,
-        latents_queue: queue.Queue,
-        result_queue: queue.Queue,
+        latents_queue: LatentQueue,
+        result_queue: ResultQueue,
         mimi_sequence_length: int,
         mimi_steps_per_latent: int,
     ):
         """Worker thread function for decoding audio latents from queue with immediate streaming."""
         try:
             audio_chunks = []
-            mimi_state = init_states(
-                self.mimi, batch_size=1, sequence_length=mimi_sequence_length
-            )
+            mimi_state = init_states(self.mimi, batch_size=1, sequence_length=mimi_sequence_length)
+            # A fresh Mimi decoder state puts a small step (about -41 dBFS) in its first samples, heard
+            # as a click at the start of every chunk: fade the first 5 ms in. (The longer burst some
+            # voices produced came from prompts ending on speech, handled by end_on_pause.)
+            fade_in: torch.Tensor | None = torch.linspace(0, 1, self.config.mimi.sample_rate // 200)
             while True:
                 latent = latents_queue.get()
                 if latent is None:
                     break
+                # Decode every latent frame the generator has queued in one call. The first frame
+                # never waits. max_decoder_frames_per_call=1 is frame-by-frame decoding.
+                latents = [latent]
+                finished = False
+                while not finished and (
+                    self.max_decoder_frames_per_call <= 0
+                    or len(latents) < self.max_decoder_frames_per_call
+                ):
+                    try:
+                        nxt = latents_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    if nxt is None:
+                        finished = True
+                    else:
+                        latents.append(nxt)
                 mimi_decoding_input = (
-                    latent * self.flow_lm.emb_std + self.flow_lm.emb_mean
+                    torch.cat(latents, dim=1) * self.flow_lm.emb_std + self.flow_lm.emb_mean
                 )
 
                 t = time.monotonic()
-                audio_frame = self.mimi.decode_from_latent(
-                    mimi_decoding_input, mimi_state
+                audio_frame = self.mimi.decode_from_latent(mimi_decoding_input, mimi_state)
+                if fade_in is not None:
+                    n = min(fade_in.numel(), audio_frame.shape[-1])
+                    audio_frame[..., :n] *= fade_in[:n].to(audio_frame)
+                    fade_in = None
+                increment_steps(
+                    self.mimi, mimi_state, increment=mimi_steps_per_latent * len(latents)
                 )
-                increment_steps(self.mimi, mimi_state, increment=mimi_steps_per_latent)
-                audio_frame_duration = (
-                    audio_frame.shape[2] / self.config.mimi.sample_rate
-                )
-                # We could log the timings here.
+                audio_frame_duration = audio_frame.shape[2] / self.config.mimi.sample_rate
                 logger.debug(
-                    " " * 30 + "Decoded %d ms of audio with mimi in %d ms",
+                    " " * 30 + "Decoded %d ms of audio (%d frames) with mimi in %d ms",
                     int(audio_frame_duration * 1000),
+                    len(latents),
                     int((time.monotonic() - t) * 1000),
                 )
                 audio_chunks.append(audio_frame)
 
                 result_queue.put(("chunk", audio_frame))
 
-                latents_queue.task_done()
+                for _ in latents:
+                    latents_queue.task_done()
+                if finished:
+                    break
 
             # Signal completion
             result_queue.put(("done", None))
@@ -535,7 +601,7 @@ class TTSModel(nn.Module):
     @torch.no_grad
     def generate_audio(
         self,
-        model_state: dict,
+        model_state: ModelState,
         text_to_generate: str,
         max_tokens: int = MAX_TOKEN_PER_CHUNK,
         frames_after_eos: int | None = None,
@@ -607,15 +673,16 @@ class TTSModel(nn.Module):
     @torch.no_grad
     def generate_audio_stream(
         self,
-        model_state: dict,
+        model_state: ModelState,
         text_to_generate: str,
         max_tokens: int = MAX_TOKEN_PER_CHUNK,
         frames_after_eos: int | None = None,
         copy_state: bool = True,
+        stop: threading.Event | None = None,
         crossfade_duration: float = DEFAULT_CROSSFADE_DURATION_S,
         silence_duration: float = DEFAULT_SILENCE_DURATION_S,
         chunk_conditioning: str = "independent",
-    ):
+    ) -> Iterator[torch.Tensor]:
         """Generate audio streaming chunks from text input.
 
         This method generates audio from text and yields chunks as they become
@@ -637,6 +704,9 @@ class TTSModel(nn.Module):
             copy_state: Whether to create a deep copy of the model state before
                 generation. If True, preserves the original state for reuse.
                 If False, modifies the input state in-place. Defaults to True.
+            stop: Optional event for cancelling the generation, for instance
+                when the user interrupts the playback. Once set, no new frames
+                are generated and the stream ends early.
             crossfade_duration: Duration, in seconds, crossfaded across the
                 boundary between consecutive sentence chunks. Long text is
                 split into per-sentence chunks that are each generated with a
@@ -668,9 +738,7 @@ class TTSModel(nn.Module):
                   (chunk[i]'s audio) is actually sampled and kept. This
                   gives the model real prior context (text and audio) to
                   continue from, at the cost of roughly double the
-                  generation work per chunk (each chunk's text is processed
-                  twice: once as the new tail, once as forced context for
-                  the next chunk).
+                  generation work per chunk.
 
         Yields:
             torch.Tensor: Audio chunks with shape [samples] at the model's
@@ -702,6 +770,8 @@ class TTSModel(nn.Module):
         """
         if frames_after_eos is None:
             frames_after_eos = self.model_recommended_frames_after_eos
+        if stop is None:
+            stop = threading.Event()
 
         if chunk_conditioning not in ("independent", "teacher_forcing"):
             raise ValueError(
@@ -715,54 +785,55 @@ class TTSModel(nn.Module):
             max_tokens,
             self.pad_with_spaces_for_short_inputs,
             remove_semicolons=self.remove_semicolons,
+            append_terminal_punctuation=self.append_terminal_punctuation,
+            capitalize_first_letter=self.capitalize_first_letter,
+            replace_characters=self.replace_characters,
         )
 
-        def short_text_streams():
-            previous_chunk_text = None
-            previous_chunk_audio = None
+        def short_text_streams() -> Iterator[Iterator[torch.Tensor]]:
+            previous_chunk_text: str | None = None
+            previous_chunk_audio: torch.Tensor | None = None
             for chunk_idx, chunk in enumerate(chunks):
-                if (
-                    chunk_conditioning == "teacher_forcing"
-                    and previous_chunk_audio is not None
-                ):
-                    # Re-process the immediately preceding chunk's text
-                    # alongside this one so the model has read-ahead context,
-                    # but always starting fresh from the original voice
-                    # prompt (never chained through generated audio) so
-                    # voice identity doesn't drift chunk to chunk.
+                if stop.is_set():
+                    break
+                if chunk_conditioning == "teacher_forcing" and previous_chunk_audio is not None:
+                    # Re-process the immediately preceding chunk's text alongside this one so
+                    # the model has read-ahead context, but always start fresh from the original
+                    # voice prompt (never chained through generated audio) so voice identity
+                    # doesn't drift chunk to chunk.
                     text_for_generation = f"{previous_chunk_text} {chunk}"
                     teacher_force_audio = previous_chunk_audio
                 else:
                     text_for_generation = chunk
                     teacher_force_audio = None
 
-                # Log progress for multi-chunk generation
                 if len(chunks) > 1:
-                    progress_pct = (chunk_idx + 1) * 100 // len(chunks)
                     logger.info(
                         "Processing chunk %d/%d (%d%% complete): %.60s...",
                         chunk_idx + 1,
                         len(chunks),
-                        progress_pct,
-                        chunk.strip()[:60],
+                        (chunk_idx + 1) * 100 // len(chunks),
+                        chunk.strip(),
                     )
 
                 prepared_text, frames_after_eos_guess = prepare_text_prompt(
                     text_for_generation,
                     self.pad_with_spaces_for_short_inputs,
                     self.remove_semicolons,
+                    self.append_terminal_punctuation,
+                    self.capitalize_first_letter,
+                    self.replace_characters,
                 )
                 frames_after_eos_guess += 2
                 effective_frames = (
-                    frames_after_eos
-                    if frames_after_eos is not None
-                    else frames_after_eos_guess
+                    frames_after_eos if frames_after_eos is not None else frames_after_eos_guess
                 )
                 stream = self._generate_audio_stream_short_text(
                     model_state=model_state,
                     text_to_generate=prepared_text,
                     frames_after_eos=effective_frames,
                     copy_state=copy_state,
+                    stop=stop,
                     teacher_force_audio=teacher_force_audio,
                 )
 
@@ -770,9 +841,9 @@ class TTSModel(nn.Module):
                     yield stream
                     continue
 
-                # Capture this chunk's newly generated audio (the forced
-                # replay of the previous chunk is never decoded, so this
-                # already excludes it) to use as next chunk's forced prefix.
+                # Capture this chunk's newly generated audio (the forced replay of the previous
+                # chunk is never decoded, so this already excludes it) to use as the next
+                # chunk's forced prefix.
                 captured: list[torch.Tensor] = []
                 yield _tap(stream, captured)
                 previous_chunk_text = chunk
@@ -785,115 +856,93 @@ class TTSModel(nn.Module):
             return
 
         crossfade_samples = int(crossfade_duration * self.sample_rate)
-        # A chunk boundary that lands on a full stop reads naturally with the
-        # whole configured pause; one from a mid-sentence fallback split
-        # (comma/semicolon/colon) or a hard word-boundary split (no
-        # punctuation at all) is not a natural breath point, so it gets a
-        # shorter one instead.
+        # A boundary that lands on a full stop reads naturally with the whole configured pause;
+        # one from a mid-sentence fallback split (comma/semicolon/colon) or a hard word-boundary
+        # split is not a natural breath point, so it gets a shorter one instead.
         boundary_silence_samples = [
             int(
                 silence_duration
                 * self.sample_rate
-                * _SILENCE_MULTIPLIER_BY_BOUNDARY_KIND[
-                    _classify_chunk_boundary(chunks[i])
-                ]
+                * _SILENCE_MULTIPLIER_BY_BOUNDARY_KIND[_classify_chunk_boundary(chunks[i])]
             )
             for i in range(len(chunks) - 1)
         ]
-        # Only bother buffering extra lookback for silence trimming if some
-        # boundary will actually get a silence gap.
+        # Only buffer extra lookback for silence trimming if some boundary gets a silence gap.
         trim_samples = (
             int(_MAX_SILENCE_TRIM_S * self.sample_rate)
-            if any(s > 0 for s in boundary_silence_samples)
+            if any(n > 0 for n in boundary_silence_samples)
             else 0
         )
         yield from _crossfade_concatenated_streams(
-            short_text_streams(),
-            crossfade_samples,
-            boundary_silence_samples,
-            trim_samples,
+            short_text_streams(), crossfade_samples, boundary_silence_samples, trim_samples
         )
 
     @torch.no_grad
     def generate_dialogue_stream(
         self,
-        turns: list[tuple[dict, str]],
+        turns: list[tuple[ModelState, str]],
         max_tokens: int = MAX_TOKEN_PER_CHUNK,
         frames_after_eos: int | None = None,
         copy_state: bool = True,
+        stop: threading.Event | None = None,
         crossfade_duration: float = DEFAULT_CROSSFADE_DURATION_S,
         silence_duration: float = DEFAULT_SILENCE_DURATION_S,
         turn_silence_duration: float = DEFAULT_DIALOGUE_SILENCE_DURATION_S,
         chunk_conditioning: str = "independent",
-    ):
+    ) -> Iterator[torch.Tensor]:
         """Generate a stitched audio stream for a multi-speaker dialogue.
 
-        Each turn is generated independently (via `generate_audio_stream()`,
-        including its own internal sentence-boundary stitching if a turn's
-        text spans multiple sentences), then turns are stitched together the
-        same way sentence chunks are: a Hann-windowed crossfade around a
-        silence gap, via `_crossfade_concatenated_streams()`. Without this,
-        concatenating separately-generated per-speaker clips produces an
-        audible raw cut at every speaker change, on top of each clip
-        potentially having a different reference loudness.
+        Each turn is generated independently (via `generate_audio_stream()`, including its own
+        internal sentence-boundary stitching if a turn's text spans multiple sentences), then
+        turns are stitched together the same way sentence chunks are: a Hann-windowed crossfade
+        around a silence gap, via `_crossfade_concatenated_streams()`. Without this,
+        concatenating separately-generated per-speaker clips produces an audible raw cut at
+        every speaker change, on top of each clip potentially having a different reference
+        loudness.
 
         Args:
-            turns: Ordered list of (model_state, text) pairs, one per
-                dialogue turn. Each model_state selects that turn's voice -
-                typically built once per speaker via
-                `get_state_for_audio_prompt()` and reused across that
-                speaker's turns.
-            max_tokens, frames_after_eos, copy_state, crossfade_duration,
-                silence_duration, chunk_conditioning: Forwarded to
-                `generate_audio_stream()` for each turn - see there for
-                details.
-            turn_silence_duration: Duration, in seconds, of true silence
-                inserted between turns (i.e. at speaker changes), as opposed
-                to `silence_duration` which applies to sentence boundaries
-                within a single turn. Conversational turn-taking paces
-                differently from narration, so this is independently
-                tunable.
+            turns: Ordered list of (model_state, text) pairs, one per dialogue turn. Each
+                model_state selects that turn's voice - typically built once per speaker via
+                `get_state_for_audio_prompt()` and reused across that speaker's turns.
+            max_tokens, frames_after_eos, copy_state, stop, crossfade_duration,
+                silence_duration, chunk_conditioning: Forwarded to `generate_audio_stream()`
+                for each turn - see there for details.
+            turn_silence_duration: Duration, in seconds, of true silence inserted between turns
+                (i.e. at speaker changes), as opposed to `silence_duration` which applies to
+                sentence boundaries within a single turn. Conversational turn-taking paces
+                differently from narration, so this is independently tunable.
 
         Yields:
-            torch.Tensor: Audio chunks with shape [samples], same as
-                `generate_audio_stream()`.
+            torch.Tensor: Audio chunks with shape [samples], same as `generate_audio_stream()`.
         """
-        if not turns:
-            return
+        if stop is None:
+            stop = threading.Event()
 
-        if len(turns) == 1:
-            model_state, text = turns[0]
-            yield from self.generate_audio_stream(
-                model_state=model_state,
-                text_to_generate=text,
-                max_tokens=max_tokens,
-                frames_after_eos=frames_after_eos,
-                copy_state=copy_state,
-                crossfade_duration=crossfade_duration,
-                silence_duration=silence_duration,
-                chunk_conditioning=chunk_conditioning,
-            )
-            return
-
-        def per_turn_streams():
+        def per_turn_streams() -> Iterator[Iterator[torch.Tensor]]:
             for model_state, text in turns:
+                if stop.is_set():
+                    break
                 yield self.generate_audio_stream(
                     model_state=model_state,
                     text_to_generate=text,
                     max_tokens=max_tokens,
                     frames_after_eos=frames_after_eos,
                     copy_state=copy_state,
+                    stop=stop,
                     crossfade_duration=crossfade_duration,
                     silence_duration=silence_duration,
                     chunk_conditioning=chunk_conditioning,
                 )
 
+        if len(turns) <= 1:
+            for stream in per_turn_streams():
+                yield from stream
+            return
+
         turn_crossfade_samples = int(crossfade_duration * self.sample_rate)
         turn_silence_samples = int(turn_silence_duration * self.sample_rate)
         trim_samples = (
-            int(_MAX_SILENCE_TRIM_S * self.sample_rate)
-            if turn_silence_samples > 0
-            else 0
+            int(_MAX_SILENCE_TRIM_S * self.sample_rate) if turn_silence_samples > 0 else 0
         )
         yield from _crossfade_concatenated_streams(
             per_turn_streams(), turn_crossfade_samples, turn_silence_samples, trim_samples
@@ -902,12 +951,13 @@ class TTSModel(nn.Module):
     @torch.no_grad
     def _generate_audio_stream_short_text(
         self,
-        model_state: dict,
+        model_state: ModelState,
         text_to_generate: str,
         frames_after_eos: int,
         copy_state: bool,
+        stop: threading.Event,
         teacher_force_audio: torch.Tensor | None = None,
-    ):
+    ) -> Iterator[torch.Tensor]:
         if copy_state:
             model_state = copy.deepcopy(model_state)
 
@@ -918,24 +968,19 @@ class TTSModel(nn.Module):
         )
 
         prepared = self.flow_lm.conditioner.prepare(text_to_generate)
-        token_count = prepared.tokens.shape[1]
+        token_count = prepared.shape[1]
         max_gen_len = self._estimate_max_gen_len(token_count)
         mimi_steps_per_latent = int(self.mimi.encoder_frame_rate / self.mimi.frame_rate)
         mimi_sequence_length = max_gen_len * mimi_steps_per_latent
 
         # Set up multithreaded generation and decoding
-        latents_queue = queue.Queue()
-        result_queue = queue.Queue()
+        latents_queue: LatentQueue = queue.Queue()
+        result_queue: ResultQueue = queue.Queue()
 
         # Start decoder worker thread
         decoder_thread = threading.Thread(
             target=self._decode_audio_worker,
-            args=(
-                latents_queue,
-                result_queue,
-                mimi_sequence_length,
-                mimi_steps_per_latent,
-            ),
+            args=(latents_queue, result_queue, mimi_sequence_length, mimi_steps_per_latent),
             daemon=True,
         )
         logger.info("starting timer now!")
@@ -950,6 +995,7 @@ class TTSModel(nn.Module):
             frames_after_eos=frames_after_eos,
             latents_queue=latents_queue,
             result_queue=result_queue,
+            stop=stop,
             forced_latents=forced_latents,
         )
 
@@ -993,33 +1039,28 @@ class TTSModel(nn.Module):
     @torch.no_grad
     def _generate(
         self,
-        model_state: dict,
-        prepared: TokenizedText,
+        model_state: ModelState,
+        prepared: torch.Tensor,
         max_gen_len: int,
         frames_after_eos: int,
-        latents_queue: queue.Queue,
-        result_queue: queue.Queue,
+        latents_queue: LatentQueue,
+        result_queue: ResultQueue,
+        stop: threading.Event,
         forced_latents: torch.Tensor | None = None,
     ):
-        token_count = prepared.tokens.shape[1]
+        token_count = prepared.shape[1]
         forced_len = forced_latents.shape[1] if forced_latents is not None else 0
         current_end = self._flow_lm_current_end(model_state)
         required_len = current_end + token_count + forced_len + max_gen_len
         self._expand_kv_cache(model_state, sequence_length=required_len)
 
         with display_execution_time("Prompting text"):
-            self._run_flow_lm_and_increment_step(
-                model_state=model_state, text_tokens=prepared.tokens
-            )
+            self._run_flow_lm_and_increment_step(model_state=model_state, text_tokens=prepared)
 
         def run_generation():
             try:
                 self._autoregressive_generation(
-                    model_state,
-                    max_gen_len,
-                    frames_after_eos,
-                    latents_queue,
-                    forced_latents,
+                    model_state, max_gen_len, frames_after_eos, latents_queue, stop, forced_latents
                 )
             except Exception as e:
                 logger.error(f"Error in autoregressive generation: {e}")
@@ -1037,10 +1078,11 @@ class TTSModel(nn.Module):
     @torch.no_grad
     def _autoregressive_generation(
         self,
-        model_state: dict,
+        model_state: ModelState,
         max_gen_len: int,
         frames_after_eos: int,
-        latents_queue: queue.Queue,
+        latents_queue: LatentQueue,
+        stop: threading.Event,
         forced_latents: torch.Tensor | None = None,
     ):
         backbone_input = torch.full(
@@ -1051,14 +1093,14 @@ class TTSModel(nn.Module):
         )
 
         if forced_latents is not None:
-            # Teacher-force the model through the previous chunk's own
-            # already-committed audio: advance the KV cache step by step as
-            # if the model had generated it (each step's *input* is the real
-            # latent, not what the model itself predicted), but discard its
-            # predictions for this span - that audio is already known and
-            # won't be re-decoded. This is what lets free generation below
-            # continue with the exact prior context instead of resetting.
+            # Teacher-force the model through the previous chunk's own already-committed audio:
+            # advance the KV cache step by step as if the model had generated it (each step's
+            # *input* is the real latent, not what the model itself predicted), but discard its
+            # predictions for this span - that audio is already known and won't be re-decoded.
+            # Free generation below then continues with the exact prior context.
             for step in range(forced_latents.shape[1]):
+                if stop.is_set():
+                    break
                 self._run_flow_lm_and_increment_step(
                     model_state=model_state, backbone_input_latents=backbone_input
                 )
@@ -1067,23 +1109,25 @@ class TTSModel(nn.Module):
         steps_times = []
         eos_step = None
         for generation_step in range(max_gen_len):
-            with display_execution_time(
-                "Generating latent", print_output=False
-            ) as timer:
+            if stop.is_set():
+                break
+            with display_execution_time("Generating latent", print_output=False) as timer:
                 next_latent, is_eos = self._run_flow_lm_and_increment_step(
                     model_state=model_state, backbone_input_latents=backbone_input
                 )
-                if is_eos.item() and eos_step is None:
-                    eos_step = generation_step
                 if (
-                    eos_step is not None
-                    and generation_step >= eos_step + frames_after_eos
+                    is_eos.item()
+                    and eos_step is None
+                    and generation_step >= self._MIN_FRAMES_BEFORE_EOS
                 ):
+                    eos_step = generation_step
+                if eos_step is not None and generation_step >= eos_step + frames_after_eos:
                     break
 
                 # Add generated latent to queue for immediate decoding
                 latents_queue.put(next_latent)
                 backbone_input = next_latent
+            assert timer.elapsed_time_ms is not None
             steps_times.append(timer.elapsed_time_ms)
         else:
             if os.environ.get("KPOCKET_TTS_ERROR_WITHOUT_EOS", "0") == "1":
@@ -1094,20 +1138,19 @@ class TTSModel(nn.Module):
 
         # Add sentinel value to signal end of generation
         latents_queue.put(None)
-        logger.info(
-            "Average generation step time: %d ms", int(statistics.mean(steps_times))
-        )
+        if steps_times:
+            logger.info("Average generation step time: %d ms", int(statistics.mean(steps_times)))
 
     @lru_cache(maxsize=2)
     def _cached_get_state_for_audio_prompt(
         self, audio_conditioning: Path | str | torch.Tensor, truncate: bool = False
-    ) -> dict:
+    ) -> ModelState:
         return self.get_state_for_audio_prompt(audio_conditioning, truncate)
 
     @torch.no_grad
     def get_state_for_audio_prompt(
         self, audio_conditioning: Path | str | torch.Tensor, truncate: bool = False
-    ) -> dict:
+    ) -> ModelState:
         """Create model state conditioned on audio prompt for continuation.
 
         This method processes an audio prompt and creates a model state that
@@ -1167,6 +1210,13 @@ class TTSModel(nn.Module):
             and audio_conditioning in _ORIGINS_OF_PREDEFINED_VOICES
         ):
             # We get the audio conditioning directly from the safetensors file.
+            if self.has_custom_weights:
+                raise ValueError(
+                    f"Predefined voice {audio_conditioning!r} is a state precomputed with the "
+                    "released weights; feeding it to other weights leaves the model out of "
+                    "distribution (it typically never emits EOS). Pass the voice as an audio "
+                    "file instead."
+                )
             if self.origin is None or not self.origin.is_relative_to(CONFIGS_DIR):
                 raise ValueError(
                     f"Cannot use predefined voices when the model "
@@ -1175,38 +1225,23 @@ class TTSModel(nn.Module):
                 )
             return _import_model_state(
                 download_if_necessary(
-                    get_predefined_voice(
-                        language=self.origin.stem, name=audio_conditioning
-                    )
+                    get_predefined_voice(language=self.origin.stem, name=audio_conditioning)
                 ),
                 self.device,
             )
 
         if isinstance(audio_conditioning, str):
-            # Download eagerly (rather than only once we know it's a safetensors source)
-            # so URLs without a .safetensors suffix in their path (e.g. a REST endpoint
-            # like /voices/<id>/data) can still be recognized via the downloaded file's
-            # server-provided filename.
+            # Download eagerly (rather than only once we know it's a safetensors source) so URLs
+            # without a .safetensors suffix in their path (e.g. a REST endpoint like
+            # /voices/<id>/data) can still be recognized via the server-provided filename.
             audio_conditioning = download_if_necessary(audio_conditioning)
 
-        if isinstance(audio_conditioning, (str, Path)) and _is_safetensors_source(
-            audio_conditioning
-        ):
+        if isinstance(audio_conditioning, Path) and _is_safetensors_source(audio_conditioning):
             return _import_model_state(audio_conditioning, self.device)
 
         if not self.has_voice_cloning and isinstance(audio_conditioning, (str, Path)):
             raise ValueError(VOICE_CLONING_UNSUPPORTED)
 
-        conditioning = self._conditioning_from_audio(audio_conditioning, truncate)
-        return self._state_from_conditioning(conditioning)
-
-    def _conditioning_from_audio(
-        self, audio_conditioning: Path | torch.Tensor, truncate: bool
-    ) -> torch.Tensor:
-        """Load (if needed) and Mimi-encode a single raw audio prompt into the
-        flow LM's conditioning space - the `prompt` tensor consumed by
-        `_state_from_conditioning()`. Used by `get_state_for_audio_prompt()`.
-        """
         if isinstance(audio_conditioning, Path):
             audio, conditioning_sample_rate = audio_read(audio_conditioning)
 
@@ -1214,578 +1249,31 @@ class TTSModel(nn.Module):
                 max_samples = int(30 * conditioning_sample_rate)  # 30 seconds of audio
                 if audio.shape[-1] > max_samples:
                     audio = audio[..., :max_samples]
-                    logger.info(
-                        f"Audio truncated to first 30 seconds ({max_samples} samples)"
-                    )
+                    logger.info(f"Audio truncated to first 30 seconds ({max_samples} samples)")
 
             audio_conditioning = convert_audio(
                 audio, conditioning_sample_rate, self.config.mimi.sample_rate, 1
             )
 
+        audio_conditioning = end_on_pause(audio_conditioning, self.config.mimi.sample_rate)
         with display_execution_time("Encoding audio prompt"):
-            return self._encode_audio(audio_conditioning.unsqueeze(0).to(self.device))
+            prompt = self._encode_audio(audio_conditioning.unsqueeze(0).to(self.device))
 
-    def _state_from_conditioning(self, prompt: torch.Tensor) -> dict:
-        """Prime a fresh model_state by running `prompt` (an audio
-        conditioning tensor from `_conditioning_from_audio()`) through the
-        flow LM.
-        """
         if self.flow_lm.insert_bos_before_voice:
             prompt = torch.cat([self.flow_lm.bos_before_voice, prompt], dim=1)
 
-        model_state = init_states(
-            self.flow_lm, batch_size=1, sequence_length=prompt.shape[1]
-        )
+        model_state = init_states(self.flow_lm, batch_size=1, sequence_length=prompt.shape[1])
 
         with display_execution_time("Prompting audio"):
-            self._run_flow_lm_and_increment_step(
-                model_state=model_state, audio_conditioning=prompt
-            )
+            self._run_flow_lm_and_increment_step(model_state=model_state, audio_conditioning=prompt)
 
         logger.info(
-            "Size of the model state for audio prompt: %d MB",
-            size_of_dict(model_state) // 1e6,
+            "Size of the model state for audio prompt: %d MB", size_of_dict(model_state) // 1e6
         )
 
         return model_state
 
     def _estimate_max_gen_len(self, token_count: int) -> int:
-        gen_len_sec = (
-            token_count / self._TOKENS_PER_SECOND_ESTIMATE + self._GEN_SECONDS_PADDING
-        )
+        gen_len_sec = token_count / self._TOKENS_PER_SECOND_ESTIMATE + self._GEN_SECONDS_PADDING
         frame_rate = self.config.mimi.frame_rate
         return math.ceil(gen_len_sec * frame_rate)
-
-
-def prepare_text_prompt(
-    text: str, pad_with_spaces_for_short_inputs: bool, remove_semicolons: bool
-) -> tuple[str, int]:
-    text = text.strip()
-    if text == "":
-        raise ValueError("Text prompt cannot be empty")
-    text = text.replace("\n", " ").replace("\r", " ").replace("  ", " ")
-    if remove_semicolons:
-        text = text.replace(";", ",")
-    number_of_words = len(text.split())
-    if number_of_words <= 4:
-        frames_after_eos_guess = 3
-    else:
-        frames_after_eos_guess = 1
-
-    # Make sure it starts with an uppercase letter
-    if not text[0].isupper():
-        text = text[0].upper() + text[1:]
-
-    # Let's make sure it ends with some kind of punctuation
-    # If it ends with a letter or digit, we add a period.
-    if text[-1].isalnum():
-        text = text + "."
-
-    # The model does not perform well when there are very few tokens, so
-    # we can add empty spaces at the beginning to increase the token count.
-    if pad_with_spaces_for_short_inputs and len(text.split()) < 5:
-        text = " " * 8 + text
-
-    return text, frames_after_eos_guess
-
-
-def _find_boundary_indices(
-    list_of_tokens: list[int], boundary_tokens: list[int]
-) -> list[int]:
-    """Find token indices where text should be split based on boundary tokens.
-
-    Returns a list of boundary positions used to slice segments. Each consecutive
-    pair (indices[i], indices[i+1]) defines one segment. The first element is
-    always 0 and the last is always len(list_of_tokens).
-    """
-    indices = [0]
-    previous_was_boundary = False
-    for idx, token in enumerate(list_of_tokens):
-        if token in boundary_tokens:
-            previous_was_boundary = True
-        else:
-            if previous_was_boundary:
-                indices.append(idx)
-            previous_was_boundary = False
-    indices.append(len(list_of_tokens))
-    return indices
-
-
-def _segments_from_boundaries(
-    list_of_tokens: list[int], boundary_indices: list[int], tokenizer
-) -> list[tuple[int, str]]:
-    """Decode token segments between boundary indices into (token_count, text) pairs."""
-    segments = []
-    for i in range(len(boundary_indices) - 1):
-        start = boundary_indices[i]
-        end = boundary_indices[i + 1]
-        text = tokenizer.sp.decode(list_of_tokens[start:end])
-        segments.append((end - start, text))
-    return segments
-
-
-def _hard_split_on_words(
-    tokenizer, text: str, max_tokens: int
-) -> list[tuple[int, str]]:
-    """Last-resort split for a chunk with no comma/semicolon/colon to break on.
-
-    Packs whole words greedily, cutting to a new segment whenever the next
-    word would push the current one over max_tokens. If a single word alone
-    exceeds max_tokens (pathological), it's kept as its own oversized
-    segment rather than split mid-word.
-    """
-    words = text.split()
-    segments = []
-    current_words: list[str] = []
-    current_nb_tokens = 0
-    for word in words:
-        candidate_text = " ".join(current_words + [word])
-        nb_tokens = len(tokenizer(candidate_text).tokens[0])
-        if current_words and nb_tokens > max_tokens:
-            segments.append((current_nb_tokens, " ".join(current_words)))
-            current_words = [word]
-            current_nb_tokens = len(tokenizer(word).tokens[0])
-        else:
-            current_words.append(word)
-            current_nb_tokens = nb_tokens
-    if current_words:
-        segments.append((current_nb_tokens, " ".join(current_words)))
-    return segments
-
-
-def split_into_best_sentences(
-    tokenizer,
-    text_to_generate: str,
-    max_tokens: int,
-    pad_with_spaces_for_short_inputs: bool,
-    remove_semicolons: bool,
-) -> list[str]:
-    text_to_generate, _ = prepare_text_prompt(
-        text_to_generate, pad_with_spaces_for_short_inputs, remove_semicolons
-    )
-    text_to_generate = text_to_generate.strip()
-    tokens = tokenizer(text_to_generate)
-    list_of_tokens = tokens.tokens[0].tolist()
-
-    _, *end_of_sentence_tokens = tokenizer(".!...?").tokens[0].tolist()
-    sentence_boundaries = _find_boundary_indices(list_of_tokens, end_of_sentence_tokens)
-    nb_tokens_and_sentences = _segments_from_boundaries(
-        list_of_tokens, sentence_boundaries, tokenizer
-    )
-
-    # Sub-split oversized sentences on commas, semicolons, and colons to prevent skipped words
-    _, *fallback_tokens = tokenizer(",;:").tokens[0].tolist()
-    refined_segments = []
-    for nb_tokens, text in nb_tokens_and_sentences:
-        if nb_tokens <= max_tokens:
-            refined_segments.append((nb_tokens, text))
-        else:
-            sub_tokens = tokenizer(text.strip()).tokens[0].tolist()
-            sub_boundaries = _find_boundary_indices(sub_tokens, fallback_tokens)
-            sub_segments = _segments_from_boundaries(
-                sub_tokens, sub_boundaries, tokenizer
-            )
-            if len(sub_segments) > 1:
-                refined_segments.extend(sub_segments)
-            else:
-                refined_segments.append((nb_tokens, text))
-
-    # A sentence with no comma/semicolon/colon (e.g. a long run-on clause)
-    # comes out of the pass above still oversized. Rather than generate it
-    # as a single out-of-distribution chunk, fall back to packing whole
-    # words up to max_tokens - a mid-sentence break is less bad than the
-    # word-skipping an oversized chunk risks.
-    final_segments = []
-    for nb_tokens, text in refined_segments:
-        if nb_tokens <= max_tokens:
-            final_segments.append((nb_tokens, text))
-        else:
-            final_segments.extend(
-                _hard_split_on_words(tokenizer, text.strip(), max_tokens)
-            )
-    refined_segments = final_segments
-
-    max_nb_tokens_in_a_chunk = max_tokens
-    chunks = []
-    current_chunk = ""
-    current_nb_of_tokens_in_chunk = 0
-    for nb_tokens, sentence in refined_segments:
-        if current_chunk == "":
-            current_chunk = sentence
-            current_nb_of_tokens_in_chunk = nb_tokens
-            continue
-
-        if current_nb_of_tokens_in_chunk + nb_tokens > max_nb_tokens_in_a_chunk:
-            chunks.append(current_chunk.strip())
-            current_chunk = sentence
-            current_nb_of_tokens_in_chunk = nb_tokens
-        else:
-            current_chunk += " " + sentence
-            current_nb_of_tokens_in_chunk += nb_tokens
-
-    if current_chunk != "":
-        chunks.append(current_chunk.strip())
-
-    for chunk in chunks:
-        chunk_tokens = tokenizer(chunk.strip()).tokens[0].tolist()
-        if len(chunk_tokens) > max_tokens:
-            logger.warning(
-                "Chunk has %d tokens (max %d), generation may skip words: '%.50s...'",
-                len(chunk_tokens),
-                max_tokens,
-                chunk,
-            )
-
-    return chunks
-
-
-# A chunk boundary from split_into_best_sentences() can land on different
-# kinds of punctuation depending on how the text had to be broken up: a full
-# stop most of the time, but a comma/semicolon/colon when an oversized
-# sentence was sub-split, or nothing at all when even that fallback failed
-# and a run-on clause was hard-split mid-word. Only the first is a natural
-# breath point, so it gets the whole configured pause; the others get a
-# fraction of it.
-_SILENCE_MULTIPLIER_BY_BOUNDARY_KIND = {
-    "sentence": 1.0,
-    "clause": 0.4,
-    "word": 0.15,
-}
-
-
-def _classify_chunk_boundary(chunk_text: str) -> str:
-    """Classify the punctuation `chunk_text` ends on: "sentence" (., !, ?,
-    possibly followed by closing quotes/brackets), "clause" (, ; :), or
-    "word" (no trailing punctuation at all).
-    """
-    stripped = chunk_text.rstrip().rstrip("\"'”’)]")
-    if not stripped:
-        return "word"
-    last = stripped[-1]
-    if last in ".!?":
-        return "sentence"
-    if last in ",;:":
-        return "clause"
-    return "word"
-
-
-def _tap(stream, sink: list):
-    """Pass an audio-chunk stream through unchanged while collecting its
-    pieces into `sink`, so the caller has the full chunk audio available
-    once the stream is exhausted (used for "teacher_forcing" conditioning).
-    """
-    for piece in stream:
-        sink.append(piece)
-        yield piece
-
-
-def _make_hann_fade_window(n: int, device, dtype) -> torch.Tensor:
-    """Create a Hann-windowed fade curve from 0 to 1.
-
-    This gives a smooth, perceptually better fade than linear, with no
-    abrupt changes in curvature at the endpoints.
-    """
-    if n <= 1:
-        return torch.ones(n, device=device, dtype=dtype)
-    # Hann window shape: 0.5 * (1 - cos(pi * i / (n - 1))) for i in 0..n-1
-    # This naturally goes from 0 at i=0 to 1 at i=n-1
-    i = torch.arange(n, device=device, dtype=dtype)
-    return 0.5 * (1 - torch.cos(math.pi * i / (n - 1)))
-
-
-def _smooth_spectral_envelope(
-    tail: torch.Tensor, head: torch.Tensor, n: int
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Smooth spectral envelope at chunk boundary using STFT analysis.
-
-    Analyzes the magnitude spectrum near the boundary and blends them to reduce
-    the "noise quality" jump that results from decoder state reset.
-
-    Args:
-        tail: Last chunk's audio (will use tail[-n:])
-        head: Next chunk's audio (will use head[:n])
-        n: Number of samples to analyze/blend at boundary
-
-    Returns:
-        (smoothed_tail, smoothed_head): Spectrally smoothed boundary segments,
-        each guaranteed to have shape [n]
-    """
-    # Use a modest FFT size for boundary analysis
-    fft_size = 2048
-    if n < 256:
-        # Not enough samples for meaningful STFT; return unchanged
-        return tail[-n:], head[:n]
-
-    try:
-        # Extract boundary regions - guaranteed to be size n
-        tail_seg = tail[-n:]
-        head_seg = head[:n]
-
-        # Use FFT on the full segment (pad if smaller than fft_size, truncate if larger)
-        if n < fft_size:
-            tail_padded = F.pad(tail_seg, (0, fft_size - n))
-            head_padded = F.pad(head_seg, (0, fft_size - n))
-        else:
-            # Take center portion for larger segments
-            start = max(0, (n - fft_size) // 2)
-            tail_padded = tail_seg[start : start + fft_size]
-            head_padded = head_seg[start : start + fft_size]
-
-        # Compute FFT and get magnitude/phase
-        tail_fft = torch.fft.rfft(tail_padded, n=fft_size)
-        head_fft = torch.fft.rfft(head_padded, n=fft_size)
-
-        tail_mag = torch.abs(tail_fft)
-        head_mag = torch.abs(head_fft)
-        head_phase = torch.angle(head_fft)
-
-        # Blend magnitudes smoothly: head's phase with blended magnitude
-        # This reduces spectral discontinuity while preserving prosody
-        fade = torch.linspace(
-            0, 1, tail_mag.shape[0], device=tail.device, dtype=tail.dtype
-        )
-        blended_mag = tail_mag * (1 - fade) + head_mag * fade
-
-        # Reconstruct: use blended magnitude + head's phase
-        blended_fft = blended_mag * torch.exp(1j * head_phase)
-        blended_time = torch.fft.irfft(blended_fft, n=fft_size)
-
-        # Blend: weight the spectrally smoothed version into the original head
-        # The longer the crossfade, the more blending. Use head_seg as base and blend in
-        smoothed_head = head_seg.clone()
-
-        # Apply spectral envelope from blended spectrum at the start of the segment
-        if blended_time.shape[0] >= n:
-            # Blend with the start of the reconstructed audio
-            spectral_component = blended_time[:n]
-        else:
-            # If reconstruction is shorter, pad it
-            spectral_component = F.pad(blended_time, (0, n - blended_time.shape[0]))
-
-        # Weight the spectral component in, scaled by envelope
-        blend_weight = 0.3  # Balance between original and spectrally smoothed (30% smooth, 70% original)
-        smoothed_head = (
-            1 - blend_weight
-        ) * head_seg + blend_weight * spectral_component
-
-        smoothed_tail = tail_seg  # Keep tail unchanged, only smooth the head
-
-        return smoothed_tail, smoothed_head
-    except Exception as e:
-        # Spectral smoothing is a best-effort enhancement; fall back if it fails
-        logger.debug(f"Spectral envelope smoothing failed: {e}, using original audio")
-        return tail[-n:], head[:n]
-
-
-# How much of a chunk's own natural trailing/leading near-silence (e.g. from
-# frames_after_eos padding) to strip before inserting the boundary's own
-# silence gap, so the gap between sentences has a consistent, configured
-# length rather than the model's trailing silence stacking on top of it.
-_MAX_SILENCE_TRIM_S = 0.3
-# Samples at or below this absolute amplitude (audio is float32 in [-1, 1])
-# count as "near silence" for trimming purposes.
-_SILENCE_TRIM_AMPLITUDE_THRESHOLD = 0.01
-
-
-def _trim_trailing_near_silence(audio: torch.Tensor, max_trim: int) -> torch.Tensor:
-    """Strip near-silent samples from the end of `audio`, looking back at
-    most `max_trim` samples. If the whole lookback window is near-silent, all
-    of it is trimmed.
-    """
-    if max_trim <= 0 or audio.shape[0] == 0:
-        return audio
-    window = audio[-max_trim:] if audio.shape[0] > max_trim else audio
-    above = (window.abs() > _SILENCE_TRIM_AMPLITUDE_THRESHOLD).nonzero(as_tuple=True)[0]
-    cut = (
-        window.shape[0]
-        if above.numel() == 0
-        else window.shape[0] - 1 - above[-1].item()
-    )
-    return audio[: audio.shape[0] - cut] if cut > 0 else audio
-
-
-def _trim_leading_near_silence(audio: torch.Tensor, max_trim: int) -> torch.Tensor:
-    """Strip near-silent samples from the start of `audio`, looking ahead at
-    most `max_trim` samples. Mirror of `_trim_trailing_near_silence`.
-    """
-    if max_trim <= 0 or audio.shape[0] == 0:
-        return audio
-    window = audio[:max_trim] if audio.shape[0] > max_trim else audio
-    above = (window.abs() > _SILENCE_TRIM_AMPLITUDE_THRESHOLD).nonzero(as_tuple=True)[0]
-    cut = window.shape[0] if above.numel() == 0 else above[0].item()
-    return audio[cut:] if cut > 0 else audio
-
-
-def _boundary_transition(
-    tail: torch.Tensor,
-    head: torch.Tensor,
-    fade_samples: int,
-    silence_samples: int,
-    trim_samples: int = 0,
-) -> tuple[list[torch.Tensor], torch.Tensor | None]:
-    """Compute the audio to emit at a chunk boundary, and the residual tail to
-    carry forward as the start of the *next* boundary's lookback window.
-
-    If `silence_samples` is 0, this is a gapless overlap-add: the trailing
-    `fade_samples` of `tail` are crossfaded into the leading `fade_samples` of
-    `head` using a Hann window, after spectral envelope smoothing to reduce
-    the "noise quality" jump that a decoder state reset otherwise produces.
-
-    If `silence_samples` is > 0, a true silent gap is inserted instead: any
-    pre-existing near-silence at the end of `tail` / start of `head` is
-    trimmed first (up to `trim_samples`, so the gap length stays consistent
-    regardless of how much trailing silence the model happened to generate),
-    then `tail` is faded down to silence, followed by `silence_samples` of
-    silence, followed by `head` fading up from silence. Fading into real
-    silence on both sides is inherently discontinuity-free (no unrelated
-    spectra are blended together), so spectral smoothing isn't needed in this
-    mode.
-    """
-    if silence_samples > 0 and trim_samples > 0:
-        tail = _trim_trailing_near_silence(tail, trim_samples)
-        head = _trim_leading_near_silence(head, trim_samples)
-
-    n = min(fade_samples, tail.shape[0], head.shape[0])
-    pieces: list[torch.Tensor] = []
-    if tail.shape[0] > n:
-        pieces.append(tail[:-n] if n > 0 else tail)
-
-    if silence_samples > 0:
-        if n > 0:
-            fade_out = _make_hann_fade_window(n, device=tail.device, dtype=tail.dtype)
-            pieces.append(tail[-n:] * (1 - fade_out))
-        pieces.append(
-            torch.zeros(silence_samples, device=head.device, dtype=head.dtype)
-        )
-        if n > 0:
-            fade_in = _make_hann_fade_window(n, device=head.device, dtype=head.dtype)
-            pieces.append(head[:n] * fade_in)
-        new_tail = head[n:] if head.shape[0] > n else None
-    elif n > 0:
-        tail_smooth, head_smooth = _smooth_spectral_envelope(tail, head, n)
-        fade_in = _make_hann_fade_window(n, device=head.device, dtype=head.dtype)
-        pieces.append(tail_smooth[-n:] * (1 - fade_in) + head_smooth[:n] * fade_in)
-        new_tail = head[n:] if head.shape[0] > n else None
-    else:
-        new_tail = head
-
-    return pieces, new_tail
-
-
-def _crossfade_concatenated_streams(
-    streams,
-    crossfade_samples: int,
-    silence_samples: int | list[int] = 0,
-    trim_samples: int = 0,
-):
-    """Concatenate a sequence of audio-chunk generators into a single stream.
-
-    Chunks within a sub-stream are passed through unchanged. Only the boundary
-    between one sub-stream and the next is treated specially, via
-    `_boundary_transition`: either a gapless Hann-windowed crossfade (with
-    spectral envelope smoothing) or a true silent gap bounded by fades to/from
-    silence, depending on whether that boundary's silence amount is 0.
-
-    `silence_samples` can be a single value applied to every boundary, or a
-    list with one entry per boundary (i.e. `len(list(streams)) - 1` entries)
-    for a per-boundary pause length. `trim_samples` bounds how much
-    pre-existing near-silence around each boundary is trimmed before the gap
-    is inserted - see `_boundary_transition`.
-    """
-    tail = None  # trailing samples produced so far, held back for the next boundary
-    # The lookback buffer needs to be large enough for both the crossfade
-    # fade window and the silence-trim search window; the smaller of the two
-    # boundary transitions ("full window arrived" vs. "stream ended early")
-    # still fires correctly on the same amount of buffered audio.
-    lookback_samples = max(crossfade_samples, trim_samples)
-
-    for boundary_idx, stream in enumerate(streams):
-        boundary_silence = (
-            silence_samples[boundary_idx - 1]
-            if isinstance(silence_samples, (list, tuple))
-            else silence_samples
-        )
-        # Even with crossfade and trimming both disabled, a nonzero silence
-        # gap still needs to probe at least one sample past the boundary to
-        # trigger `_boundary_transition`.
-        needed = 0
-        if tail is not None:
-            needed = lookback_samples or (1 if boundary_silence > 0 else 0)
-        boundary_chunks = []
-        boundary_len = 0
-
-        for piece in stream:
-            if piece.shape[0] == 0:
-                continue
-
-            if needed > 0:
-                boundary_chunks.append(piece)
-                boundary_len += piece.shape[0]
-                if boundary_len < needed:
-                    continue
-                head = torch.cat(boundary_chunks)
-                pieces, tail = _boundary_transition(
-                    tail, head, crossfade_samples, boundary_silence, trim_samples
-                )
-                yield from pieces
-                needed = 0
-                continue
-
-            tail = piece if tail is None else torch.cat([tail, piece])
-            if tail.shape[0] > lookback_samples:
-                cut = tail.shape[0] - lookback_samples
-                yield tail[:cut]
-                tail = tail[cut:]
-
-        if needed > 0 and boundary_chunks:
-            # The sub-stream ended before enough samples arrived to fill a full
-            # boundary window; transition with however much we got.
-            head = torch.cat(boundary_chunks)
-            pieces, tail = _boundary_transition(
-                tail, head, crossfade_samples, boundary_silence, trim_samples
-            )
-            yield from pieces
-
-    if tail is not None and tail.shape[0] > 0:
-        yield tail
-
-
-def export_model_state(
-    model_state: dict[str, dict[str, torch.Tensor]],
-    dest: str | Path,
-    metadata: dict[str, str] | None = None,
-):
-    dict_to_store = {}
-    for module_name, module_state in model_state.items():
-        for key, tensor_value in module_state.items():
-            dict_to_store[f"{module_name}/{key}"] = tensor_value
-    safetensors.torch.save_file(dict_to_store, dest, metadata=metadata)
-
-
-def _is_safetensors_source(source: str | Path) -> bool:
-    source_text = str(source)
-    if source_text.startswith(("http://", "https://")):
-        source_text = urlsplit(source_text).path
-    elif source_text.startswith("hf://"):
-        source_text = source_text.rsplit("@", 1)[0]
-    return source_text.endswith(".safetensors")
-
-
-def _import_model_state(
-    source: str | Path, device: torch.device
-) -> dict[str, dict[str, torch.Tensor]]:
-    result = {}
-    with safetensors.safe_open(source, framework="pt") as f:
-        for key in f.keys():
-            module_name, tensor_key = key.split("/")
-            result.setdefault(module_name, {})
-            if tensor_key == "current_end":
-                # we used the shape[0] as step index before for torch.compile() compatibility,
-                # but it's not needed anymore
-                tensor = f.get_tensor(key)
-                result[module_name]["offset"] = torch.full(
-                    (1,), fill_value=tensor.shape[0], dtype=torch.long, device=device
-                )
-            else:
-                result[module_name][tensor_key] = f.get_tensor(key).to(device)
-    return result

@@ -1,7 +1,13 @@
+from pathlib import Path
+
+import pytest
+
 from pocket_tts.utils import utils
 
 
-def test_download_http_cache_suffix_ignores_query_string(monkeypatch, tmp_path):
+def test_download_http_cache_suffix_ignores_query_string(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
     class Response:
         content = b"data"
 
@@ -35,3 +41,13 @@ def test_download_http_uses_content_disposition_when_url_has_no_suffix(monkeypat
     assert cached_file.parent == tmp_path
     assert cached_file.suffix == ".safetensors"
     assert cached_file.read_bytes() == b"data"
+
+
+@pytest.mark.parametrize(
+    "config_path", sorted((Path(__file__).parent.parent / "pocket_tts" / "config").glob("*.yaml"))
+)
+def test_shipped_configs_sample_at_the_tuned_temperature(config_path: Path):
+    # Configs without an explicit value used to fall back to 0.7 silently (#322).
+    from pocket_tts.utils.config import load_config
+
+    assert load_config(config_path).default_temperature == 0.3
